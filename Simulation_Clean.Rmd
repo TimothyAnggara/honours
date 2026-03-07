@@ -1,0 +1,1341 @@
+---
+title: "Simulation"
+output: html_document
+date: "2025-12-24"
+---
+
+# Libraries
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(spatstat.geom)
+library(spatstat.random)
+library(spatstat.explore)
+library(SpatialExperiment)
+library(spicyR)
+library(TreeBH)
+library(DART)
+source("pfilter.R")
+```
+
+# Globals + Helpers
+
+```{r}
+set.seed(1)
+
+# --- Global window (define ONCE)
+WIN <- owin(c(0, 1000), c(0, 1000))
+
+# --- subtype -> major map (define ONCE)
+MAJOR_MAP <- c(CD4="T", CD8="T", Treg="T", B="B", NK="NK")
+
+# --- canonicalize "B__CD4" and "CD4__B" -> "B__CD4"
+canonical_pair <- function(x) {
+  ab <- strsplit(x, "__", fixed = TRUE)
+  vapply(ab, function(z) paste(sort(z), collapse="__"), character(1))
+}
+
+leaf_to_family <- function(leaf) {
+  ab <- strsplit(leaf, "__", fixed = TRUE)[[1]]
+  fam <- sort(c(MAJOR_MAP[ab[1]], MAJOR_MAP[ab[2]]))
+  paste(fam, collapse="__")
+}
+
+# --- BH helper (your exact logic, reusable)
+bh_reject <- function(p, q = 0.05) {
+  p <- as.numeric(p)
+  m <- length(p)
+  o <- order(p)
+  ps <- p[o]
+  thr <- (seq_len(m) / m) * q
+  k <- max(which(ps <= thr), 0)
+  out <- rep(FALSE, m)
+  if (k > 0) out[o[seq_len(k)]] <- TRUE
+  out
+}
+
+# --- spatstat intensity normalization
+normalize_im <- function(im) im / integral.im(im)
+
+# --- Poisson PP helper
+simulate_pp <- function(n, win) {
+  pts <- rpoispp(n / area.owin(win), win = win)
+  tibble(x = pts$x, y = pts$y)
+}
+
+make_ids <- function(i, condition) {
+  list(
+    imageID   = factor(paste0(condition, "_img_", i)),
+    subject   = factor(i),
+    condition = factor(condition)
+  )
+}
+
+finalise_cellData <- function(cellData, ids) {
+  cellData %>%
+    mutate(
+      imageID   = ids$imageID,
+      subject   = ids$subject,
+      condition = ids$condition,
+      cellType_sub = factor(cellType_sub, levels = c("CD4","CD8","Treg","B","NK")),
+      cellType_major = factor(cellType_major, levels = c("T","B","NK"))
+    )
+}
+
+# -----------------------------
+# Shared helpers you call later
+# -----------------------------
+allocate_T_subtypes <- function(n_T) {
+  t_sub_props <- c(CD4 = 0.70, CD8 = 0.20, Treg = 0.10)
+  n_sub <- as.vector(rmultinom(1, n_T, prob = t_sub_props))
+  names(n_sub) <- names(t_sub_props)
+  n_sub
+}
+
+simulate_T_baseline <- function(n_T, win = WIN) {
+  t_pts <- simulate_pp(n_T, win)
+  pp_T  <- ppp(t_pts$x, t_pts$y, window = win)
+  kT    <- density.ppp(pp_T, sigma = bw.diggle(pp_T))
+  list(t_pts = t_pts, kT = kT)
+}
+
+# -----------------------------
+# Extract leaf-level vectors from spicy objects (aligned + canonicalized)
+# -----------------------------
+extract_leaf_stats <- function(spicy_sub, conditionB, eps = 1e-12) {
+  colB <- paste0("condition", conditionB)
+
+  stopifnot(colB %in% colnames(spicy_sub$p.value))
+  stopifnot(colB %in% colnames(spicy_sub$coefficient))
+
+  p_raw <- spicy_sub$p.value[, colB]
+  c_raw <- spicy_sub$coefficient[, colB]
+  inter <- rownames(spicy_sub$p.value)
+
+  df <- tibble(
+    interaction = inter,
+    leaf = canonical_pair(interaction),
+    pval = as.numeric(p_raw),
+    coef = as.numeric(c_raw)
+  ) %>%
+    group_by(leaf) %>%
+    slice(1) %>%          # drops NK__CD4 vs CD4__NK duplicates
+    ungroup() %>%
+    mutate(pval = pmin(pmax(pval, eps), 1 - eps))
+
+  df
+}
+
+extract_major_pvals <- function(spicy_major, conditionB) {
+  colB <- paste0("condition", conditionB)
+
+  stopifnot(colB %in% colnames(spicy_major$p.value))
+
+  inter <- rownames(spicy_major$p.value)
+
+  tibble(
+    interaction = inter,
+    major = canonical_pair(inter),
+    p_major = as.numeric(spicy_major$p.value[, colB])
+  ) %>%
+    group_by(major) %>%
+    slice(1) %>%
+    ungroup()
+}
+
+```
+
+# Simulation Functions
+
+## T / CD4 Attracted to NK
+
+### Leaf-level (CD4 is attracted to NK cells)
+
+- NK is generated first, and kNK is estimated from NK points
+
+- baseline T intensity kT is estimated
+
+- CD8 and Treg are sampled from kT (baseline)
+
+- CD4 is sampled from mixture between kT and kNK
+
+```{r}
+simulate_leaf_T_to_NK <- function(i, win = WIN, total_cells = 500, w_nk = 0.70) {
+  set.seed(i)
+
+  props <- c(T=0.75, B=0.15, NK=0.10)
+  n_T  <- rpois(1, total_cells * props["T"])
+  n_B  <- rpois(1, total_cells * props["B"])
+  n_NK <- rpois(1, total_cells * props["NK"])
+  n_sub <- allocate_T_subtypes(n_T)
+
+  # NK baseline intensity
+  nk_pts <- simulate_pp(n_NK, win)
+  pp_NK  <- ppp(nk_pts$x, nk_pts$y, window = win)
+  kNK    <- density.ppp(pp_NK, sigma = bw.diggle(pp_NK))
+
+  # T baseline intensity
+  Tb <- simulate_T_baseline(n_T, win)
+  kT <- Tb$kT
+
+  # CD8/Treg from baseline T
+  sim_T <- function(n, label) {
+    if (n <= 0) return(NULL)
+    pp <- rpoint(n, f = kT, win = win)
+    tibble(x=pp$x, y=pp$y, cellType_sub=label, cellType_major="T")
+  }
+  cd8  <- sim_T(n_sub["CD8"],  "CD8")
+  treg <- sim_T(n_sub["Treg"], "Treg")
+
+  # CD4 attracted to NK: mix kernel (T + NK), sample CD4 from it
+  k_cd4 <- (1 - w_nk) * normalize_im(kT) + w_nk * normalize_im(kNK)
+  pp_cd4 <- rpoint(n_sub["CD4"], f = k_cd4, win = win)
+  cd4 <- tibble(x=pp_cd4$x, y=pp_cd4$y, cellType_sub="CD4", cellType_major="T")
+
+  b <- simulate_pp(n_B, win) %>% transmute(x,y, cellType_sub="B", cellType_major="B")
+  nk <- nk_pts %>% transmute(x,y, cellType_sub="NK", cellType_major="NK")
+
+  cellData <- bind_rows(cd4, cd8, treg, b, nk)
+  finalise_cellData(cellData, make_ids(i, "LeafSignal_TtoNK"))
+}
+```
+
+## Internal-level (T-cells moves towards NK)
+
+- NK is generated first, and kNK is estimated from NK points
+
+- baseline T intensity kT is estimated
+
+- CD4, CD8, and Treg are sampled from a mixture of kT (baseline) and kNK
+
+
+```{r}
+simulate_internal_T_to_NK <- function(i, win = WIN, total_cells = 500, w_nk = 0.70) {
+  set.seed(i)
+
+  props <- c(T=0.75, B=0.15, NK=0.10)
+  n_T  <- rpois(1, total_cells * props["T"])
+  n_B  <- rpois(1, total_cells * props["B"])
+  n_NK <- rpois(1, total_cells * props["NK"])
+  n_sub <- allocate_T_subtypes(n_T)
+
+  # NK baseline intensity
+  nk_pts <- simulate_pp(n_NK, win)
+  pp_NK  <- ppp(nk_pts$x, nk_pts$y, window = win)
+  kNK    <- density.ppp(pp_NK, sigma = bw.diggle(pp_NK))
+
+  # T baseline intensity
+  Tb <- simulate_T_baseline(n_T, win)
+  kT <- Tb$kT
+
+  # All T subtypes attracted to NK
+  k_mix <- (1 - w_nk) * normalize_im(kT) + w_nk * normalize_im(kNK)
+  sim_mix <- function(n, label) {
+    if (n <= 0) return(NULL)
+    pp <- rpoint(n, f = k_mix, win = win)
+    tibble(x=pp$x, y=pp$y, cellType_sub=label, cellType_major="T")
+  }
+  t_sub <- bind_rows(
+    sim_mix(n_sub["CD4"],  "CD4"),
+    sim_mix(n_sub["CD8"],  "CD8"),
+    sim_mix(n_sub["Treg"], "Treg")
+  )
+
+  b <- simulate_pp(n_B, win) %>% transmute(x,y, cellType_sub="B", cellType_major="B")
+  nk <- nk_pts %>% transmute(x,y, cellType_sub="NK", cellType_major="NK")
+
+  cellData <- bind_rows(t_sub, b, nk)
+  finalise_cellData(cellData, make_ids(i, "InternalSignal_TtoNK"))
+}
+```
+
+## NK attracted to CD4 / T cells
+
+### Leaf-Level (NK moves towards CD4)
+
+- T subtypes are generated from baseline T intensity kT (including CD4)
+
+- from the simulated CD4 points, you estimate kCD4
+
+- NK baseline kNK is estimated from random NK points
+
+- NK is sampled from mixture of kNK and kCD4
+
+```{r}
+simulate_leaf_NK_to_CD4 <- function(i, win = WIN, total_cells = 500, w_cd4 = 0.70) {
+  set.seed(i)
+
+  props <- c(T=0.75, B=0.15, NK=0.10)
+  n_T  <- rpois(1, total_cells * props["T"])
+  n_B  <- rpois(1, total_cells * props["B"])
+  n_NK <- rpois(1, total_cells * props["NK"])
+  n_sub <- allocate_T_subtypes(n_T)
+
+  # T baseline intensity
+  Tb <- simulate_T_baseline(n_T, win)
+  kT <- Tb$kT
+
+  # Simulate all T subtypes from baseline T (including CD4)
+  sim_T <- function(n, label) {
+    if (n <= 0) return(NULL)
+    pp <- rpoint(n, f = kT, win = win)
+    tibble(x=pp$x, y=pp$y, cellType_sub=label, cellType_major="T")
+  }
+  cd4  <- sim_T(n_sub["CD4"],  "CD4")
+  cd8  <- sim_T(n_sub["CD8"],  "CD8")
+  treg <- sim_T(n_sub["Treg"], "Treg")
+
+  # CD4 density (attractor target for NK)
+  pp_CD4 <- ppp(cd4$x, cd4$y, window = win)
+  kCD4 <- density.ppp(pp_CD4, sigma = bw.diggle(pp_CD4))
+
+  # NK baseline density (for mixing)
+  nk_base <- simulate_pp(n_NK, win)
+  pp_NK   <- ppp(nk_base$x, nk_base$y, window = win)
+  kNK     <- density.ppp(pp_NK, sigma = bw.diggle(pp_NK))
+
+  # NK attracted to CD4
+  k_nk <- (1 - w_cd4) * normalize_im(kNK) + w_cd4 * normalize_im(kCD4)
+  pp_nk <- rpoint(n_NK, f = k_nk, win = win)
+  nk <- tibble(x=pp_nk$x, y=pp_nk$y, cellType_sub="NK", cellType_major="NK")
+
+  b <- simulate_pp(n_B, win) %>% transmute(x,y, cellType_sub="B", cellType_major="B")
+
+  cellData <- bind_rows(cd4, cd8, treg, b, nk)
+  finalise_cellData(cellData, make_ids(i, "LeafSignal_NKtoCD4"))
+}
+```
+
+### Internal (NK Moves towards T Cells)
+
+- T subtypes are generated from baseline T intensity kT (including CD4)
+
+- from the simulated CD4 points, you estimate kCD4
+
+- NK baseline kNK is estimated from random NK points
+
+- NK is sampled from mixture of kNK and kT
+
+```{r}
+simulate_internal_NK_to_T <- function(i, win = WIN, total_cells = 500, w_t = 0.70) {
+  set.seed(i)
+
+  props <- c(T=0.75, B=0.15, NK=0.10)
+  n_T  <- rpois(1, total_cells * props["T"])
+  n_B  <- rpois(1, total_cells * props["B"])
+  n_NK <- rpois(1, total_cells * props["NK"])
+  n_sub <- allocate_T_subtypes(n_T)
+
+  # T baseline intensity
+  Tb <- simulate_T_baseline(n_T, win)
+  kT <- Tb$kT
+
+  # Simulate all T subtypes from baseline T
+  sim_T <- function(n, label) {
+    if (n <= 0) return(NULL)
+    pp <- rpoint(n, f = kT, win = win)
+    tibble(x=pp$x, y=pp$y, cellType_sub=label, cellType_major="T")
+  }
+  t_sub <- bind_rows(
+    sim_T(n_sub["CD4"],  "CD4"),
+    sim_T(n_sub["CD8"],  "CD8"),
+    sim_T(n_sub["Treg"], "Treg")
+  )
+
+  # NK baseline density (for mixing)
+  nk_base <- simulate_pp(n_NK, win)
+  pp_NK   <- ppp(nk_base$x, nk_base$y, window = win)
+  kNK     <- density.ppp(pp_NK, sigma = bw.diggle(pp_NK))
+
+  # NK attracted to overall T intensity
+  k_nk <- (1 - w_t) * normalize_im(kNK) + w_t * normalize_im(kT)
+  pp_nk <- rpoint(n_NK, f = k_nk, win = win)
+  nk <- tibble(x=pp_nk$x, y=pp_nk$y, cellType_sub="NK", cellType_major="NK")
+
+  b <- simulate_pp(n_B, win) %>% transmute(x,y, cellType_sub="B", cellType_major="B")
+
+  cellData <- bind_rows(t_sub, b, nk)
+  finalise_cellData(cellData, make_ids(i, "InternalSignal_NKtoT"))
+}
+```
+
+## Simulate Null
+
+- T subtypes all from baseline kT
+
+- B and NK are uniform Poisson
+
+- No mixing was seen
+
+```{r}
+simulate_null <- function(i, win = WIN, total_cells = 500) {
+  set.seed(i)
+
+  props <- c(T=0.75, B=0.15, NK=0.10)
+  n_T  <- rpois(1, total_cells * props["T"])
+  n_B  <- rpois(1, total_cells * props["B"])
+  n_NK <- rpois(1, total_cells * props["NK"])
+  n_sub <- allocate_T_subtypes(n_T)
+
+  # baseline T intensity
+  Tb <- simulate_T_baseline(n_T, win)
+  kT <- Tb$kT
+
+  sim_T <- function(n, label) {
+    if (n <= 0) return(NULL)
+    pp <- rpoint(n, f = kT, win = win)
+    tibble(x=pp$x, y=pp$y, cellType_sub=label, cellType_major="T")
+  }
+
+  t_sub <- bind_rows(
+    sim_T(n_sub["CD4"],  "CD4"),
+    sim_T(n_sub["CD8"],  "CD8"),
+    sim_T(n_sub["Treg"], "Treg")
+  )
+
+  b  <- simulate_pp(n_B,  win) %>% transmute(x,y, cellType_sub="B",  cellType_major="B")
+  nk <- simulate_pp(n_NK, win) %>% transmute(x,y, cellType_sub="NK", cellType_major="NK")
+
+  cellData <- bind_rows(t_sub, b, nk)
+  finalise_cellData(cellData, make_ids(i, "Null"))
+}
+```
+
+# Generate the Dataset
+
+```{r}
+N_PER_COND <- 100
+
+cellData_all <- bind_rows(
+  lapply(1:N_PER_COND, simulate_null),
+
+  # Part A: T/CD4 -> NK
+  lapply(1:N_PER_COND, simulate_leaf_T_to_NK),
+  lapply(1:N_PER_COND, simulate_internal_T_to_NK),
+
+  # Part B: NK -> CD4/T
+  lapply(1:N_PER_COND, simulate_leaf_NK_to_CD4),
+  lapply(1:N_PER_COND, simulate_internal_NK_to_T)
+)
+
+table(cellData_all$condition)
+```
+
+# Building the SpatialExperiment
+
+```{r}
+spe <- SpatialExperiment(
+  spatialCoords = as.matrix(cellData_all[, c("x", "y")]),
+  colData = cellData_all %>%
+    select(imageID, subject, condition, cellType_sub, cellType_major)
+)
+```
+
+# running spicyR: Null vs each condition
+
+```{r}
+run_spicy_contrast <- function(spe, cond_A = "Null", cond_B, level = c("sub", "major")) {
+  level <- match.arg(level)
+  cell_col <- if (level == "sub") "cellType_sub" else "cellType_major"
+
+  spe2 <- spe[, spe$condition %in% c(cond_A, cond_B)]
+  spe2$condition <- droplevels(spe2$condition)
+  spe2$imageID   <- droplevels(spe2$imageID)
+  spe2[[cell_col]] <- droplevels(spe2[[cell_col]])
+
+  spicy(
+    spe2,
+    condition = "condition",
+    subject   = "subject",
+    cellType  = cell_col,
+    imageID   = "imageID"
+  )
+}
+```
+
+# Running the Simulation
+
+```{r}
+conds <- c("LeafSignal_TtoNK", "InternalSignal_TtoNK",
+           "LeafSignal_NKtoCD4", "InternalSignal_NKtoT")
+
+spicy_sub_list   <- setNames(lapply(conds, \(cc) run_spicy_contrast(spe, "Null", cc, "sub")),   conds)
+spicy_major_list <- setNames(lapply(conds, \(cc) run_spicy_contrast(spe, "Null", cc, "major")), conds)
+
+# Quick sanity: top pairs
+lapply(spicy_sub_list, topPairs)
+lapply(spicy_major_list, topPairs)
+```
+
+```{r}
+example_imgs <- cellData_all %>%
+  distinct(imageID, condition) %>%
+  group_by(condition) %>%
+  slice_sample(n = 1) %>%
+  pull(imageID)
+
+cellData_all %>%
+  filter(imageID %in% example_imgs) %>%
+  ggplot(aes(x, y, color = cellType_sub)) +
+  geom_point(size = 0.6, alpha = 0.7) +
+  coord_fixed() +
+  facet_wrap(~ condition) +
+  theme_minimal()
+```
+
+# TreeBH
+
+TreeBH needs ONLY:
+  
+  1. Leaf p-values -> numeric vector
+  2. Tree structure -> integer matrix
+  
+TreeBH assumes that you already know the correct biological hierarchy and asks: "Given this tree, how do I control FDR?"
+
+- Internal leaves are implicitly recomputed via Simes from the leaves
+
+What is Simes? It's a way to combine several p-values into a single-value or the hypothesis "at least one of these is non-null"
+
+TreeBH instead of controlling for global FDR, it tries to control something else called sFDR where instead of controllling FDR for all the hypotheses, its conly controlling the FDR of all the hypothesis chosen and their children
+
+So how are we going to transform the tests we have into a tree?
+
+- Level 0: root 
+- Level 1: Major-Major interaction family
+  - Group by the major cell types of the pair:
+    - `T__T`
+    - `T__B`
+    - `T__NK`
+    - `B__B`
+    - `B__NK`
+    - `NK__NK`
+- Level 2: Subtype-Subtype within the family
+  - Under `T__T`
+    - `CD4__CD4`
+    - `CD4__CD8`
+    - `CD4__Treg`
+    - `CD8__CD8`
+    - `CD8__Treg`
+    - `Treg__Treg`
+  - Under `T__B`
+    - `CD4__B`
+    - `CD8__B`
+    - `Treg__B`
+  - Under `B__B`
+    - `B__B`
+  - Under `B__NK`
+    - `B__NK`
+  - Under `NK__NK`
+    - `NK__NK`
+
+Note that we have hypothesis such as `CD8__CD4` and `CD4__CD8`, we'll juts keep one of the two
+
+```{r}
+# -----------------------------
+# TreeBH: build groups + run
+# -----------------------------
+
+build_treebh_inputs <- function(spicy_sub, conditionB,
+                                major_map = MAJOR_MAP,
+                                eps = 1e-12) {
+  # 1) leaf-level pvals/coefs (canonicalized, de-duplicated)
+  df_leaf <- extract_leaf_stats(spicy_sub, conditionB = conditionB, eps = eps) %>%
+    tidyr::separate(leaf, into = c("a", "b"), sep = "__", remove = FALSE) %>%
+    dplyr::mutate(
+      ma = unname(major_map[a]),
+      mb = unname(major_map[b]),
+      fam = canonical_pair(paste(ma, mb, sep = "__"))
+    ) %>%
+    dplyr::select(leaf, fam, pval, coef)
+
+  # 2) TreeBH groups matrix (2 levels)
+  #    level1: family index
+  #    level2: leaf-within-family index
+  groups <- cbind(
+    level1 = as.integer(factor(df_leaf$fam)),
+    level2 = as.integer(factor(paste(df_leaf$fam, df_leaf$leaf, sep = "/")))
+  )
+
+  list(
+    df_leaf = df_leaf,
+    pvals   = df_leaf$pval,
+    groups  = groups
+  )
+}
+
+run_treebh <- function(spicy_sub, conditionB,
+                       q = c(0.2, 0.2),
+                       major_map = MAJOR_MAP,
+                       eps = 1e-12) {
+
+  inp <- build_treebh_inputs(
+    spicy_sub  = spicy_sub,
+    conditionB = conditionB,
+    major_map  = major_map,
+    eps        = eps
+  )
+
+  res <- TreeBH::get_TreeBH_selections(
+    pvals  = inp$pvals,
+    groups = inp$groups,
+    q      = q
+  )
+
+  # TreeBH returns a matrix with a column per level; leaf selections are in level 2
+  leaf_reject <- (res[, 2] == 1)
+
+  inp$df_leaf %>%
+    dplyr::mutate(
+      reject_treebh = leaf_reject
+    ) %>%
+    dplyr::arrange(fam, leaf)
+}
+```
+
+```{r}
+q_tree <- c(0.2, 0.2)
+
+treebh_sub_results <- purrr::imap(spicy_sub_list, \(sp_obj, cc) {
+  run_treebh(
+    spicy_sub  = sp_obj,
+    conditionB = cc,      # e.g. "LeafSignal_TtoNK"
+    q          = q_tree
+  ) %>%
+    mutate(condition = cc)
+})
+
+treebh_sub_df <- bind_rows(treebh_sub_results)
+
+treebh_sub_df %>%
+  group_by(condition) %>%
+  summarise(n_reject = sum(reject_treebh), .groups = "drop")
+```
+
+# DART
+
+DART composes of two stages:
+  1. Building a tree from a distance matrix between hypotheses
+  2. Tests bottom-up on the tree
+  
+Similarly to treeBH, it needs leaf hypotheses 
+
+DART assumes you don't know the hierarchy but have distances that hint at co-status and asks: "Can I learn a tree from distances and then test on it safely?"
+
+- Don't know the correct hierarchy
+- Only know pairwise distances between leaf hypotheses
+- Distance reflects likelihood for shared signal
+
+In treeBH the internal represents the hypothesis: At least one of my descendant leaf hypothesis is non-null but in DART, the internal node represents: "These leaf hypotheses are close enough (in distance) that they may share signal
+
+```{r}
+extract_leaf_for_dart <- function(spicy_sub, conditionB, eps = 1e-10) {
+  colB <- paste0("condition", conditionB)
+
+  stopifnot(colB %in% colnames(spicy_sub$p.value))
+  stopifnot(colB %in% colnames(spicy_sub$coefficient))
+
+  inter <- rownames(spicy_sub$p.value)
+
+  df <- tibble(
+    interaction = inter,
+    leaf = canonical_pair(interaction),
+    pval = as.numeric(spicy_sub$p.value[, colB]),
+    coef = as.numeric(spicy_sub$coefficient[, colB])
+  ) %>%
+    group_by(leaf) %>%
+    slice(1) %>%                     # drop A__B vs B__A duplicates
+    ungroup() %>%
+    mutate(pval = pmin(pmax(pval, eps), 1 - eps)) %>%
+    arrange(leaf)
+
+  list(
+    df = df,
+    pvals = setNames(df$pval, df$leaf),
+    coefs = setNames(df$coef, df$leaf)
+  )
+}
+
+make_hypothesis_distance <- function(leaf_names, major_map = MAJOR_MAP) {
+
+  cell_dist <- function(x, y) {
+    if (x == y) return(0L)
+    if (major_map[[x]] == major_map[[y]]) return(1L)
+    2L
+  }
+
+  parse_pair <- function(s) {
+    ab <- strsplit(s, "__", fixed = TRUE)[[1]]
+    ab <- sort(ab)
+    list(a = ab[1], b = ab[2])
+  }
+
+  pairs <- lapply(leaf_names, parse_pair)
+
+  m <- length(leaf_names)
+  D <- matrix(0, m, m, dimnames = list(leaf_names, leaf_names))
+
+  for (i in seq_len(m)) {
+    a <- pairs[[i]]$a; b <- pairs[[i]]$b
+    for (j in seq_len(m)) {
+      c <- pairs[[j]]$a; d <- pairs[[j]]$b
+      D[i, j] <- min(
+        cell_dist(a, c) + cell_dist(b, d),
+        cell_dist(a, d) + cell_dist(b, c)
+      )
+    }
+  }
+
+  D
+}
+
+run_dart_one <- function(spicy_sub, spe, cond_B,
+                         cond_A = "Null",
+                         alpha = 0.05,
+                         eps = 1e-10,
+                         Mgroup = 2) {
+
+  # 1) leaf pvals + coefs
+  leaf <- extract_leaf_for_dart(spicy_sub, conditionB = cond_B, eps = eps)
+  pvals <- leaf$pvals
+  coefs <- leaf$coefs
+  leaf_names <- names(pvals)
+
+  # 2) distance matrix (normalize to [0,1])
+  D <- make_hypothesis_distance(leaf_names, major_map = MAJOR_MAP)
+  D2 <- D / max(D)
+
+  # 3) signed z-scores (two-sided)
+  z <- qnorm(1 - as.numeric(pvals) / 2) * sign(as.numeric(coefs))
+  T1 <- matrix(z, nrow = 1)  # 1 x m
+
+  # 4) n = number of images for this contrast
+  spe2 <- spe[, spe$condition %in% c(cond_A, cond_B)]
+  n_images <- length(unique(spe2$imageID))
+
+  m <- length(pvals)
+  n <- n_images
+  grids <- 16 / sqrt(n * log(m) * log(log(m)))
+
+  # 5) build aggregation tree + test
+  Atree <- DART::A.tree.mult(
+    grids  = grids,
+    Dist0  = D2,
+    Mgroup = Mgroup
+  )
+
+  res <- DART::test.mult(
+    alpha = alpha,
+    Llist = Atree$Llist,
+    Dist0 = D2,
+    T1    = T1
+  )
+
+  # leaf indices rejected by DART
+  dart_idx <- res[[length(res)]]
+
+  dart_reject <- rep(FALSE, m)
+  if (length(dart_idx) > 0) dart_reject[dart_idx] <- TRUE
+
+  # return tidy leaf table + also raw objects for debugging
+  list(
+    summary = tibble(
+      condition = cond_B,
+      leaf      = leaf_names,
+      pval      = as.numeric(pvals),
+      coef      = as.numeric(coefs),
+      reject    = dart_reject
+    ) %>% arrange(pval),
+    dart_idx = dart_idx,
+    Atree    = Atree,
+    Dist     = D2
+  )
+}
+
+```
+
+```{r}
+dart_out_list <- purrr::imap(spicy_sub_list, \(sp_obj, cc) {
+  run_dart_one(
+    spicy_sub = sp_obj,
+    spe       = spe,
+    cond_B    = cc,
+    alpha     = 0.05
+  )
+})
+
+# leaf-level results combined
+dart_df <- bind_rows(lapply(dart_out_list, `[[`, "summary"))
+
+# quick counts
+dart_df %>%
+  group_by(condition) %>%
+  summarise(n_reject = sum(reject), .groups = "drop")
+```
+
+# P-Filter (Not Working Rn)
+
+```{r}
+extract_pfilter_inputs <- function(spicy_sub, spicy_major, cond_B, eps = 1e-12) {
+  colB <- paste0("condition", cond_B)
+
+  stopifnot(colB %in% colnames(spicy_sub$p.value))
+  stopifnot(colB %in% colnames(spicy_major$p.value))
+
+  # ---- major level (families)
+  major_df <- tibble(
+    interaction = rownames(spicy_major$p.value),
+    fam = canonical_pair(rownames(spicy_major$p.value)),
+    p_major = as.numeric(spicy_major$p.value[, colB])
+  ) %>%
+    group_by(fam) %>%
+    slice(1) %>%
+    ungroup() %>%
+    mutate(p_major = pmin(pmax(p_major, eps), 1 - eps)) %>%
+    arrange(fam)
+
+  # ---- leaf level (subtype pairs)
+  sub_df <- tibble(
+    interaction = rownames(spicy_sub$p.value),
+    leaf = canonical_pair(rownames(spicy_sub$p.value)),
+    p_sub = as.numeric(spicy_sub$p.value[, colB])
+  ) %>%
+    group_by(leaf) %>%
+    slice(1) %>%                 # drop A__B vs B__A duplicates
+    ungroup() %>%
+    tidyr::separate(leaf, into = c("a","b"), sep="__", remove = FALSE) %>%
+    mutate(
+      fam = canonical_pair(paste0(MAJOR_MAP[a], "__", MAJOR_MAP[b])),
+      p_sub = pmin(pmax(p_sub, eps), 1 - eps)
+    ) %>%
+    select(leaf, fam, p_sub) %>%
+    arrange(fam, leaf)
+
+  list(major_df = major_df, sub_df = sub_df)
+}
+
+
+run_pfilter_one <- function(spicy_sub, spicy_major, cond_B,
+                            alpha_major = 0.05,
+                            alpha_leaf  = 0.05,
+                            eps = 1e-12) {
+
+  inp <- extract_pfilter_inputs(spicy_sub, spicy_major, cond_B, eps = eps)
+  major_df <- inp$major_df
+  sub_df   <- inp$sub_df
+
+  n_major <- nrow(major_df)
+  n_sub   <- nrow(sub_df)
+  n_total <- n_major + n_sub
+
+  # Combine p-values in the order: majors first, then leaves
+  P_all <- c(major_df$p_major, sub_df$p_sub)
+
+  # groups matrix: n_total x 2
+  groups <- matrix(0L, nrow = n_total, ncol = 2)
+
+  # Layer 1: hierarchy constraint
+  # majors: 1..n_major
+  groups[1:n_major, 1] <- seq_len(n_major)
+
+  # leaves: inherit parent's major group
+  parent_idx <- match(sub_df$fam, major_df$fam)
+  if (anyNA(parent_idx)) {
+    stop("Some leaf families did not match any major family. Check MAJOR_MAP / canonicalization.")
+  }
+  groups[(n_major + 1):n_total, 1] <- parent_idx
+
+  # Layer 2: discovery layer (each test unique)
+  groups[, 2] <- seq_len(n_total)
+
+  # Run pfilter (from your pfilter.R)
+  res <- pfilter(
+    P      = P_all,
+    alphas = c(alpha_major, alpha_leaf),
+    groups = groups
+  )
+
+  # Extract leaf rejections (last n_sub)
+  leaf_reject <- res[(n_major + 1):n_total] == 1
+
+  # Return tidy table at leaf level
+  tibble(
+    condition = cond_B,
+    leaf      = sub_df$leaf,
+    fam       = sub_df$fam,
+    pval      = sub_df$p_sub,
+    reject    = leaf_reject
+  ) %>% arrange(fam, pval)
+}
+```
+
+```{r}
+pfilter_df <- purrr::imap_dfr(spicy_sub_list, \(sp_sub, cc) {
+  run_pfilter_one(
+    spicy_sub   = sp_sub,
+    spicy_major = spicy_major_list[[cc]],
+    cond_B      = cc,
+    alpha_major = 0.05,
+    alpha_leaf  = 0.05
+  )
+})
+
+# Count discoveries per condition
+pfilter_df %>%
+  group_by(condition) %>%
+  summarise(n_reject = sum(reject), .groups = "drop")
+```
+
+# Clustering + Thinning (BY)
+
+```{r}
+extract_major_leaf_tables <- function(spicy_sub, spicy_major, cond_B, eps = 1e-12) {
+  colB <- paste0("condition", cond_B)
+
+  stopifnot(colB %in% colnames(spicy_sub$p.value))
+  stopifnot(colB %in% colnames(spicy_major$p.value))
+
+  # Major families (canonicalized)
+  major_df <- tibble(
+    interaction = rownames(spicy_major$p.value),
+    fam = canonical_pair(rownames(spicy_major$p.value)),
+    p_major = as.numeric(spicy_major$p.value[, colB])
+  ) %>%
+    group_by(fam) %>%
+    slice(1) %>%
+    ungroup() %>%
+    mutate(p_major = pmin(pmax(p_major, eps), 1 - eps)) %>%
+    arrange(fam)
+
+  # Leaf hypotheses (canonicalized + mapped to fam via MAJOR_MAP)
+  sub_df <- tibble(
+    interaction = rownames(spicy_sub$p.value),
+    leaf = canonical_pair(rownames(spicy_sub$p.value)),
+    p_sub = as.numeric(spicy_sub$p.value[, colB])
+  ) %>%
+    group_by(leaf) %>%
+    slice(1) %>%   # drop CD4__NK vs NK__CD4 duplicates
+    ungroup() %>%
+    tidyr::separate(leaf, into = c("a", "b"), sep = "__", remove = FALSE) %>%
+    mutate(
+      fam = canonical_pair(paste0(MAJOR_MAP[a], "__", MAJOR_MAP[b])),
+      p_sub = pmin(pmax(p_sub, eps), 1 - eps)
+    ) %>%
+    select(leaf, fam, p_sub) %>%
+    arrange(fam, leaf)
+
+  list(major_df = major_df, sub_df = sub_df)
+}
+
+cluster_test_major <- function(p_major, q = 0.05, method = c("BY", "BH")) {
+  method <- match.arg(method)
+
+  adj <- p.adjust(p_major, method = method)
+  sig <- adj <= q
+
+  sig_fams <- names(p_major)[sig]
+
+  # u1 cutoff = largest *raw* p-value among rejected major clusters (as per your note)
+  u1 <- if (any(sig)) max(p_major[sig]) else q
+
+  list(sig_fams = sig_fams, u1 = u1, adj = adj)
+}
+
+calculate_trimming_p <- function(z_subtype, u1_cutoff, rho = 0.5, m0_m = 0.9) {
+  num <- m0_m * pnorm((qnorm(1 - u1_cutoff) - rho * z_subtype) / sqrt(1 - rho^2))
+  den <- (m0_m * u1_cutoff + (1 - m0_m))
+  p_trim <- num / den
+  pmin(pmax(p_trim, 0), 1)
+}
+
+run_cluster_trim_one <- function(spicy_sub, spicy_major, cond_B,
+                                 q = 0.05,
+                                 major_method = c("BY", "BH"),
+                                 rho = 0.5,
+                                 m0_m = 0.9,
+                                 two_sided_z = FALSE,
+                                 eps = 1e-12) {
+
+  major_method <- match.arg(major_method)
+
+  inp <- extract_major_leaf_tables(spicy_sub, spicy_major, cond_B, eps = eps)
+  major_df <- inp$major_df
+  sub_df   <- inp$sub_df
+
+  p_major <- major_df$p_major
+  names(p_major) <- major_df$fam
+
+  # ---- Stage 1: major cluster testing
+  maj <- cluster_test_major(p_major, q = q, method = major_method)
+  sig_fams <- maj$sig_fams
+  u1 <- maj$u1
+
+  # ---- Stage 2: trimming within significant families
+  out <- sub_df %>%
+    mutate(
+      in_sig_family = fam %in% sig_fams,
+      z_subtype = if (two_sided_z) qnorm(1 - p_sub / 2) else qnorm(1 - p_sub),
+      p_trimmed = ifelse(
+        in_sig_family,
+        vapply(z_subtype, calculate_trimming_p, numeric(1),
+               u1_cutoff = u1, rho = rho, m0_m = m0_m),
+        NA_real_
+      ),
+      reject = in_sig_family & !is.na(p_trimmed) & (p_trimmed <= q)
+    ) %>%
+    arrange(fam, p_sub)
+
+  list(
+    condition = cond_B,
+    sig_major_fams = sig_fams,
+    u1_cutoff = u1,
+    major_table = major_df %>% mutate(adj = maj$adj),
+    leaf_table = out
+  )
+}
+```
+
+```{r}
+cluster_trim_list <- purrr::imap(spicy_sub_list, \(sp_sub, cc) {
+  run_cluster_trim_one(
+    spicy_sub   = sp_sub,
+    spicy_major = spicy_major_list[[cc]],
+    cond_B      = cc,
+    q           = 0.05,
+    major_method = "BY",   # <- or "BH"
+    rho         = 0.5,
+    m0_m        = 0.9,
+    two_sided_z = FALSE
+  )
+})
+
+cluster_trim_df <- bind_rows(lapply(cluster_trim_list, \(x) {
+  x$leaf_table %>% mutate(condition = x$condition, u1_cutoff = x$u1_cutoff)
+}))
+
+# how many trimmed discoveries per condition?
+cluster_trim_df %>%
+  group_by(condition) %>%
+  summarise(n_reject = sum(reject), .groups = "drop")
+```
+
+# Our Method
+
+The method that we're proposing is instead of making to make our own internal p-values, we can make our own internal p-values. We can use this tree structure that we used for the treeBH example
+
+- Level 0: root 
+- Level 1: Major-Major interaction family
+  - Group by the major cell types of the pair:
+    - `T__T`
+    - `T__B`
+    - `T__NK`
+    - `B__B`
+    - `B__NK`
+    - `NK__NK`
+- Level 2: Subtype-Subtype within the damily
+  - Under `T__T`
+    - `CD4__CD4`
+    - `CD4__CD8`
+    - `CD4__Treg`
+    - `CD8__CD8`
+    - `CD8__Treg`
+    - `Treg__Treg`
+  - Under `T__B`
+    - `CD4__B`
+    - `CD8__B`
+    - `Treg__B`
+  - Under `B__B`
+    - `B__B`
+  - Under `B__NK`
+    - `B__NK`
+  - Under `NK__NK`
+    - `NK__NK`
+    
+
+```{r}
+make_tree_df_from_spicy <- function(spicy_major, spicy_sub, cond_B, eps = 1e-12) {
+  colB <- paste0("condition", cond_B)
+
+  stopifnot(colB %in% colnames(spicy_major$p.value))
+  stopifnot(colB %in% colnames(spicy_sub$p.value))
+
+  # ---- Level 1: major families
+  maj_df <- tibble(
+    interaction = rownames(spicy_major$p.value),
+    node = canonical_pair(rownames(spicy_major$p.value)),
+    level = 1L,
+    parent = NA_character_,
+    pvalue = as.numeric(spicy_major$p.value[, colB])
+  ) %>%
+    group_by(node) %>% slice(1) %>% ungroup() %>%   # drop duplicates after canonicalization
+    mutate(pvalue = pmin(pmax(pvalue, eps), 1 - eps)) %>%
+    select(node, level, parent, pvalue)
+
+  # ---- Level 2: subtype leaves
+  leaf_df <- tibble(
+    interaction = rownames(spicy_sub$p.value),
+    node = canonical_pair(rownames(spicy_sub$p.value)),
+    level = 2L,
+    pvalue = as.numeric(spicy_sub$p.value[, colB])
+  ) %>%
+    group_by(node) %>% slice(1) %>% ungroup() %>%   # drop duplicates after canonicalization
+    tidyr::separate(node, into = c("a","b"), sep="__", remove = FALSE) %>%
+    mutate(
+      parent = canonical_pair(paste0(MAJOR_MAP[a], "__", MAJOR_MAP[b])),
+      pvalue = pmin(pmax(pvalue, eps), 1 - eps)
+    ) %>%
+    select(node, level, parent, pvalue)
+
+  # keep only leaves whose parent exists in major level
+  leaf_df <- leaf_df %>% filter(parent %in% maj_df$node)
+
+  bind_rows(maj_df, leaf_df) %>%
+    arrange(level, parent, node)
+}
+
+run_levelwise_bh <- function(tree_df, q = 0.05) {
+  L1 <- tree_df %>% filter(level == 1)
+  L2 <- tree_df %>% filter(level == 2)
+
+  # Level 1 BH across majors
+  L1 <- L1 %>%
+    mutate(tested = TRUE,
+           reject = bh_reject(pvalue, q))
+
+  sig_parents <- L1$node[L1$reject]
+
+  # Level 2 BH within selected major families only
+  L2 <- L2 %>%
+    mutate(tested = parent %in% sig_parents,
+           reject = FALSE)
+
+  if (any(L2$tested)) {
+    idx <- which(L2$tested)
+    L2$reject[idx] <- bh_reject(L2$pvalue[idx], q)
+  }
+
+  bind_rows(L1, L2) %>% arrange(level, parent, node)
+}
+
+run_ours_one <- function(spicy_major, spicy_sub, cond_B, q = 0.05) {
+  tree_df <- make_tree_df_from_spicy(spicy_major, spicy_sub, cond_B)
+
+  res_ours <- run_levelwise_bh(tree_df, q = q)
+
+  leaf_df <- tree_df %>% filter(level == 2)
+
+  # vanilla BH across all leaves
+  bh_all <- bh_reject(leaf_df$pvalue, q = q)
+  bh_set <- leaf_df$node[bh_all]
+
+  our_set <- res_ours %>% filter(level == 2, reject) %>% pull(node)
+
+  list(
+    tree_df = tree_df,
+    res_ours = res_ours,
+    sig_families = res_ours %>% filter(level == 1, reject),
+    sig_leaves = res_ours %>% filter(level == 2, reject),
+    compare = list(
+      BH_all_n = length(bh_set),
+      Our_n = length(our_set),
+      overlap_n = length(intersect(bh_set, our_set)),
+      ours_only = setdiff(our_set, bh_set),
+      bh_only = setdiff(bh_set, our_set)
+    )
+  )
+}
+```
+
+```{r}
+ours_out <- purrr::imap(conds, \(cc, .i) {
+  run_ours_one(
+    spicy_major = spicy_major_list[[cc]],
+    spicy_sub   = spicy_sub_list[[cc]],
+    cond_B      = cc,
+    q           = 0.05
+  )
+})
+names(ours_out) <- conds
+
+# Quick summary table
+tibble(
+  condition = conds,
+  our_n = sapply(ours_out, \(x) nrow(x$sig_leaves)),
+  bh_n  = sapply(ours_out, \(x) x$compare$BH_all_n),
+  overlap = sapply(ours_out, \(x) x$compare$overlap_n)
+)
+```
+
+# Summarize Everything
+
+
+```{r}
+# =========================================================
+# 1) Define the ground-truth signal you injected (leaf-level)
+# =========================================================
+
+truth_map <- function(cond) {
+  # return a list describing the injected signal
+  # - leaves: canonical leaf names that are truly non-null
+  # - scope: "leaf" if only one leaf is non-null; "internal" if a whole family is non-null
+  if (cond == "LeafSignal_TtoNK") {
+    return(list(scope = "leaf",     leaves = canonical_pair("CD4__NK")))
+  }
+  if (cond == "InternalSignal_TtoNK") {
+    return(list(scope = "internal", leaves = canonical_pair(c("CD4__NK","CD8__NK","Treg__NK"))))
+  }
+  if (cond == "LeafSignal_NKtoCD4") {
+    return(list(scope = "leaf",     leaves = canonical_pair("CD4__NK")))
+  }
+  if (cond == "InternalSignal_NKtoT") {
+    return(list(scope = "internal", leaves = canonical_pair(c("CD4__NK","CD8__NK","Treg__NK"))))
+  }
+
+  # default (shouldn't happen if conds is as defined)
+  list(scope = "none", leaves = character(0))
+}
+
+# =========================================================
+# 2) Build a "base" leaf table per condition from spicy_sub
+#    (pval/coef + fam mapping + truth columns)
+# =========================================================
+
+build_leaf_base <- function(spicy_sub, cond_B, eps = 1e-12) {
+  # aligned + canonicalized + de-duped; already defined earlier by you
+  df <- extract_leaf_stats(spicy_sub, conditionB = cond_B, eps = eps) %>%
+    tidyr::separate(leaf, into = c("a","b"), sep="__", remove = FALSE) %>%
+    mutate(
+      fam = canonical_pair(paste0(MAJOR_MAP[a], "__", MAJOR_MAP[b]))
+    ) %>%
+    select(condition = interaction, leaf, fam, pval, coef) %>%
+    mutate(condition = cond_B) %>%
+    select(condition, fam, leaf, pval, coef) %>%
+    arrange(fam, leaf)
+
+  tr <- truth_map(cond_B)
+  df %>%
+    mutate(
+      truth_signal = leaf %in% tr$leaves,
+      truth_scope  = ifelse(truth_signal, tr$scope, "none")
+    )
+}
+
+leaf_base_df <- purrr::imap_dfr(spicy_sub_list, \(sp_obj, cc) {
+  build_leaf_base(sp_obj, cond_B = cc)
+})
+
+# =========================================================
+# 3) Build method-specific "significance" tables at leaf level
+# =========================================================
+
+# --- BH across ALL leaves (per condition)
+bh_all_df <- leaf_base_df %>%
+  group_by(condition) %>%
+  mutate(sig_BH_all = bh_reject(pval, q = 0.05)) %>%
+  ungroup() %>%
+  select(condition, leaf, sig_BH_all)
+
+# --- TreeBH (you already made treebh_sub_df)
+treebh_sig_df <- treebh_sub_df %>%
+  transmute(condition, leaf = leaf, sig_TreeBH = reject_treebh)
+
+# --- DART (you already made dart_df)
+dart_sig_df <- dart_df %>%
+  transmute(condition, leaf, sig_DART = reject)
+
+# --- PFilter (you already made pfilter_df)
+pfilter_sig_df <- pfilter_df %>%
+  transmute(condition, leaf, sig_PFilter = reject)
+
+# --- Cluster+Trim (you already made cluster_trim_df)
+clustertrim_sig_df <- cluster_trim_df %>%
+  transmute(condition, leaf, sig_ClusterTrim = reject)
+
+# --- Our method (ours_out list: each has $sig_leaves with node names)
+ours_sig_df <- purrr::imap_dfr(ours_out, \(x, cc) {
+  tibble(condition = cc, leaf = x$sig_leaves$node, sig_Ours = TRUE)
+})
+
+# =========================================================
+# 4) Join everything into ONE summary table
+# =========================================================
+
+summary_leaf_df <- leaf_base_df %>%
+  left_join(bh_all_df,         by = c("condition","leaf")) %>%
+  left_join(treebh_sig_df,     by = c("condition","leaf")) %>%
+  left_join(dart_sig_df,       by = c("condition","leaf")) %>%
+  left_join(ours_sig_df,       by = c("condition","leaf")) %>%
+  left_join(pfilter_sig_df,    by = c("condition","leaf")) %>%
+  left_join(clustertrim_sig_df,by = c("condition","leaf")) %>%
+  mutate(
+    sig_TreeBH      = tidyr::replace_na(sig_TreeBH, FALSE),
+    sig_DART        = tidyr::replace_na(sig_DART, FALSE),
+    sig_Ours        = tidyr::replace_na(sig_Ours, FALSE),
+    sig_PFilter     = tidyr::replace_na(sig_PFilter, FALSE),
+    sig_ClusterTrim = tidyr::replace_na(sig_ClusterTrim, FALSE)
+  ) %>%
+  arrange(condition, fam, leaf, pval)
+
+summary_leaf_df
+
+# Optionally: write to CSV
+# write.csv(summary_leaf_df, "summary_leaf_table.csv", row.names = FALSE)
+
+# =========================================================
+# 5) OPTIONAL: per-condition confusion summary per method
+# =========================================================
+
+confusion_one <- function(df, sig_col) {
+  sig <- df[[sig_col]]
+  truth <- df$truth_signal
+  tibble(
+    method = sig_col,
+    TP = sum(sig & truth),
+    FP = sum(sig & !truth),
+    FN = sum(!sig & truth),
+    TN = sum(!sig & !truth)
+  )
+}
+
+perf_by_condition <- summary_leaf_df %>%
+  group_by(condition) %>%
+  group_modify(\(d, ...) {
+    bind_rows(
+      confusion_one(d, "sig_BH_all"),
+      confusion_one(d, "sig_TreeBH"),
+      confusion_one(d, "sig_DART"),
+      confusion_one(d, "sig_Ours"),
+      confusion_one(d, "sig_PFilter"),
+      confusion_one(d, "sig_ClusterTrim")
+    )
+  }) %>%
+  ungroup()
+
+perf_by_condition
+```
+
+```{r}
+summary_leaf_df %>% filter(truth_scope == "leaf")
+summary_leaf_df %>% filter(truth_scope == "internal")
+```
+
+```{r}
+
+df_filtered <- summary_leaf_df %>%
+  filter(
+    truth_signal == TRUE |
+    (
+      truth_signal == FALSE &
+      (
+        sig_BH_all |
+        sig_TreeBH |
+        sig_DART |
+        sig_Ours |
+        sig_PFilter |
+        sig_ClusterTrim
+      )
+    )
+  )
+
+view(df_filtered)
+```
+
