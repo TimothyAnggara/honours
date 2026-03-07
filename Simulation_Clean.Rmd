@@ -82,6 +82,10 @@ finalise_cellData <- function(cellData, ids) {
     )
 }
 
+safe_bw_diggle <- function(pp, hmax = 200) {
+  bw.diggle(pp, hmax = hmax)
+}
+
 # -----------------------------
 # Shared helpers you call later
 # -----------------------------
@@ -95,7 +99,7 @@ allocate_T_subtypes <- function(n_T) {
 simulate_T_baseline <- function(n_T, win = WIN) {
   t_pts <- simulate_pp(n_T, win)
   pp_T  <- ppp(t_pts$x, t_pts$y, window = win)
-  kT    <- density.ppp(pp_T, sigma = bw.diggle(pp_T))
+  kT    <- density.ppp(pp_T, sigma = safe_bw_diggle(pp_T))
   list(t_pts = t_pts, kT = kT)
 }
 
@@ -172,7 +176,7 @@ simulate_leaf_T_to_NK <- function(i, win = WIN, total_cells = 500, w_nk = 0.70) 
   # NK baseline intensity
   nk_pts <- simulate_pp(n_NK, win)
   pp_NK  <- ppp(nk_pts$x, nk_pts$y, window = win)
-  kNK    <- density.ppp(pp_NK, sigma = bw.diggle(pp_NK))
+  kNK    <- density.ppp(pp_NK, sigma = safe_bw_diggle(pp_NK))
 
   # T baseline intensity
   Tb <- simulate_T_baseline(n_T, win)
@@ -222,7 +226,7 @@ simulate_internal_T_to_NK <- function(i, win = WIN, total_cells = 500, w_nk = 0.
   # NK baseline intensity
   nk_pts <- simulate_pp(n_NK, win)
   pp_NK  <- ppp(nk_pts$x, nk_pts$y, window = win)
-  kNK    <- density.ppp(pp_NK, sigma = bw.diggle(pp_NK))
+  kNK    <- density.ppp(pp_NK, sigma = safe_bw_diggle(pp_NK))
 
   # T baseline intensity
   Tb <- simulate_T_baseline(n_T, win)
@@ -287,12 +291,12 @@ simulate_leaf_NK_to_CD4 <- function(i, win = WIN, total_cells = 500, w_cd4 = 0.7
 
   # CD4 density (attractor target for NK)
   pp_CD4 <- ppp(cd4$x, cd4$y, window = win)
-  kCD4 <- density.ppp(pp_CD4, sigma = bw.diggle(pp_CD4))
+  kCD4 <- density.ppp(pp_CD4, sigma = safe_bw_diggle(pp_CD4))
 
   # NK baseline density (for mixing)
   nk_base <- simulate_pp(n_NK, win)
   pp_NK   <- ppp(nk_base$x, nk_base$y, window = win)
-  kNK     <- density.ppp(pp_NK, sigma = bw.diggle(pp_NK))
+  kNK     <- density.ppp(pp_NK, sigma = safe_bw_diggle(pp_NK))
 
   # NK attracted to CD4
   k_nk <- (1 - w_cd4) * normalize_im(kNK) + w_cd4 * normalize_im(kCD4)
@@ -345,7 +349,7 @@ simulate_internal_NK_to_T <- function(i, win = WIN, total_cells = 500, w_t = 0.7
   # NK baseline density (for mixing)
   nk_base <- simulate_pp(n_NK, win)
   pp_NK   <- ppp(nk_base$x, nk_base$y, window = win)
-  kNK     <- density.ppp(pp_NK, sigma = bw.diggle(pp_NK))
+  kNK     <- density.ppp(pp_NK, sigma = safe_bw_diggle(pp_NK))
 
   # NK attracted to overall T intensity
   k_nk <- (1 - w_t) * normalize_im(kNK) + w_t * normalize_im(kT)
@@ -401,21 +405,156 @@ simulate_null <- function(i, win = WIN, total_cells = 500) {
 }
 ```
 
+
 # Generate the Dataset
 
+## Creating Wrappers
+
+### T / CD4 -> NK
+
+#### CD4 -> NK
+
 ```{r}
-N_PER_COND <- 100
+simulate_leaf_T_to_NK_weak <- function(i, win = WIN, total_cells = 500) {
+  out <- simulate_leaf_T_to_NK(i, win = win, total_cells = total_cells, w_nk = 0.30)
+  out$condition <- factor("LeafSignal_TtoNK_weak")
+  out$imageID   <- factor(paste0("LeafSignal_TtoNK_weak_img_", i))
+  out
+}
+
+simulate_leaf_T_to_NK_medium <- function(i, win = WIN, total_cells = 500) {
+  out <- simulate_leaf_T_to_NK(i, win = win, total_cells = total_cells, w_nk = 0.50)
+  out$condition <- factor("LeafSignal_TtoNK_medium")
+  out$imageID   <- factor(paste0("LeafSignal_TtoNK_medium_img_", i))
+  out
+}
+
+simulate_leaf_T_to_NK_strong <- function(i, win = WIN, total_cells = 500) {
+  out <- simulate_leaf_T_to_NK(i, win = win, total_cells = total_cells, w_nk = 0.80)
+  out$condition <- factor("LeafSignal_TtoNK_strong")
+  out$imageID   <- factor(paste0("LeafSignal_TtoNK_strong_img_", i))
+  out
+}
+```
+
+#### T -> NK
+
+```{r}
+simulate_internal_T_to_NK_weak <- function(i, win = WIN, total_cells = 500) {
+  out <- simulate_internal_T_to_NK(i, win = win, total_cells = total_cells, w_nk = 0.30)
+  out$condition <- factor("InternalSignal_TtoNK_weak")
+  out$imageID   <- factor(paste0("InternalSignal_TtoNK_weak_img_", i))
+  out
+}
+
+simulate_internal_T_to_NK_medium <- function(i, win = WIN, total_cells = 500) {
+  out <- simulate_internal_T_to_NK(i, win = win, total_cells = total_cells, w_nk = 0.50)
+  out$condition <- factor("InternalSignal_TtoNK_medium")
+  out$imageID   <- factor(paste0("InternalSignal_TtoNK_medium_img_", i))
+  out
+}
+
+simulate_internal_T_to_NK_strong <- function(i, win = WIN, total_cells = 500) {
+  out <- simulate_internal_T_to_NK(i, win = win, total_cells = total_cells, w_nk = 0.80)
+  out$condition <- factor("InternalSignal_TtoNK_strong")
+  out$imageID   <- factor(paste0("InternalSignal_TtoNK_strong_img_", i))
+  out
+}
+```
+
+### NK -> CD4 / T
+
+#### NK -> CD4
+
+```{r}
+simulate_leaf_NK_to_CD4_weak <- function(i, win = WIN, total_cells = 500) {
+  out <- simulate_leaf_NK_to_CD4(i, win = win, total_cells = total_cells, w_cd4 = 0.30)
+  out$condition <- factor("LeafSignal_NKtoCD4_weak")
+  out$imageID   <- factor(paste0("LeafSignal_NKtoCD4_weak_img_", i))
+  out
+}
+
+simulate_leaf_NK_to_CD4_medium <- function(i, win = WIN, total_cells = 500) {
+  out <- simulate_leaf_NK_to_CD4(i, win = win, total_cells = total_cells, w_cd4 = 0.50)
+  out$condition <- factor("LeafSignal_NKtoCD4_medium")
+  out$imageID   <- factor(paste0("LeafSignal_NKtoCD4_medium_img_", i))
+  out
+}
+
+simulate_leaf_NK_to_CD4_strong <- function(i, win = WIN, total_cells = 500) {
+  out <- simulate_leaf_NK_to_CD4(i, win = win, total_cells = total_cells, w_cd4 = 0.80)
+  out$condition <- factor("LeafSignal_NKtoCD4_strong")
+  out$imageID   <- factor(paste0("LeafSignal_NKtoCD4_strong_img_", i))
+  out
+}
+```
+
+#### NK -> T
+
+```{r}
+simulate_internal_NK_to_T_weak <- function(i, win = WIN, total_cells = 500) {
+  out <- simulate_internal_NK_to_T(i, win = win, total_cells = total_cells, w_t = 0.30)
+  out$condition <- factor("InternalSignal_NKtoT_weak")
+  out$imageID   <- factor(paste0("InternalSignal_NKtoT_weak_img_", i))
+  out
+}
+
+simulate_internal_NK_to_T_medium <- function(i, win = WIN, total_cells = 500) {
+  out <- simulate_internal_NK_to_T(i, win = win, total_cells = total_cells, w_t = 0.50)
+  out$condition <- factor("InternalSignal_NKtoT_medium")
+  out$imageID   <- factor(paste0("InternalSignal_NKtoT_medium_img_", i))
+  out
+}
+
+simulate_internal_NK_to_T_strong <- function(i, win = WIN, total_cells = 500) {
+  out <- simulate_internal_NK_to_T(i, win = win, total_cells = total_cells, w_t = 0.80)
+  out$condition <- factor("InternalSignal_NKtoT_strong")
+  out$imageID   <- factor(paste0("InternalSignal_NKtoT_strong_img_", i))
+  out
+}
+```
+
+
+
+```{r}
+N_PER_COND <- 25
+
+# cellData_all <- bind_rows(
+#   lapply(1:N_PER_COND, simulate_null),
+# 
+#   # Part A: T/CD4 -> NK
+#   lapply(1:N_PER_COND, simulate_leaf_T_to_NK),
+#   lapply(1:N_PER_COND, simulate_internal_T_to_NK),
+# 
+#   # Part B: NK -> CD4/T
+#   lapply(1:N_PER_COND, simulate_leaf_NK_to_CD4),
+#   lapply(1:N_PER_COND, simulate_internal_NK_to_T)
+# )
 
 cellData_all <- bind_rows(
   lapply(1:N_PER_COND, simulate_null),
 
+  # -----------------------------
   # Part A: T/CD4 -> NK
-  lapply(1:N_PER_COND, simulate_leaf_T_to_NK),
-  lapply(1:N_PER_COND, simulate_internal_T_to_NK),
+  # -----------------------------
+  lapply(1:N_PER_COND, simulate_leaf_T_to_NK_weak),
+  lapply(1:N_PER_COND, simulate_leaf_T_to_NK_medium),
+  lapply(1:N_PER_COND, simulate_leaf_T_to_NK_strong),
 
-  # Part B: NK -> CD4/T
-  lapply(1:N_PER_COND, simulate_leaf_NK_to_CD4),
-  lapply(1:N_PER_COND, simulate_internal_NK_to_T)
+  lapply(1:N_PER_COND, simulate_internal_T_to_NK_weak),
+  lapply(1:N_PER_COND, simulate_internal_T_to_NK_medium),
+  lapply(1:N_PER_COND, simulate_internal_T_to_NK_strong),
+
+  # -----------------------------
+  # Part B: NK -> CD4 / T
+  # -----------------------------
+  lapply(1:N_PER_COND, simulate_leaf_NK_to_CD4_weak),
+  lapply(1:N_PER_COND, simulate_leaf_NK_to_CD4_medium),
+  lapply(1:N_PER_COND, simulate_leaf_NK_to_CD4_strong),
+
+  lapply(1:N_PER_COND, simulate_internal_NK_to_T_weak),
+  lapply(1:N_PER_COND, simulate_internal_NK_to_T_medium),
+  lapply(1:N_PER_COND, simulate_internal_NK_to_T_strong)
 )
 
 table(cellData_all$condition)
