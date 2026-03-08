@@ -14,6 +14,7 @@ library(SpatialExperiment)
 library(spicyR)
 library(TreeBH)
 library(DART)
+library(dplyr)
 source("pfilter.R")
 ```
 
@@ -46,6 +47,50 @@ run_spicy_contrast <- function(spe, cond_A, cond_B, level = c("sub", "major")) {
     cellType  = cell_col,
     imageID   = "imageID"
   )
+}
+
+MAJOR_MAP <- c(CD4="T", CD8="T", Treg="T", B="B", NK="NK")
+
+canonical_pair <- function(x) {
+  ab <- strsplit(x, "__", fixed = TRUE)
+  vapply(ab, function(z) paste(sort(z), collapse="__"), character(1))
+}
+
+bh_reject <- function(p, q = 0.05) {
+  p <- as.numeric(p)
+  m <- length(p)
+  o <- order(p)
+  ps <- p[o]
+  thr <- (seq_len(m) / m) * q
+  k <- max(which(ps <= thr), 0)
+  out <- rep(FALSE, m)
+  if (k > 0) out[o[seq_len(k)]] <- TRUE
+  out
+}
+
+extract_leaf_stats <- function(spicy_sub, conditionB, eps = 1e-12) {
+  colB <- paste0("condition", conditionB)
+
+  tibble(
+    interaction = rownames(spicy_sub$p.value),
+    leaf = canonical_pair(rownames(spicy_sub$p.value)),
+    pval = as.numeric(spicy_sub$p.value[, colB]),
+    coef = as.numeric(spicy_sub$coefficient[, colB])
+  ) %>%
+    distinct(leaf, .keep_all = TRUE) %>%
+    mutate(pval = pmin(pmax(pval, eps), 1 - eps))
+}
+
+extract_major_pvals <- function(spicy_major, conditionB, eps = 1e-12) {
+  colB <- paste0("condition", conditionB)
+
+  tibble(
+    interaction = rownames(spicy_major$p.value),
+    fam = canonical_pair(rownames(spicy_major$p.value)),
+    p_major = as.numeric(spicy_major$p.value[, colB])
+  ) %>%
+    distinct(fam, .keep_all = TRUE) %>%
+    mutate(p_major = pmin(pmax(p_major, eps), 1 - eps))
 }
 ```
 
@@ -148,5 +193,726 @@ topPairs(spicy_major_list[["LeafSignal_TtoNK_weak"]])
 
 topPairs(spicy_pairs_sub[["Leaf_TtoNK"]])
 topPairs(spicy_pairs_major[["Leaf_TtoNK"]])
+```
+
+# Contrast Table
+
+## `spe`
+
+```{r}
+contrast_table_null <- tibble(
+  scenario = names(spicy_sub_list),
+  cond_B   = names(spicy_sub_list),
+  type     = "null_vs_signal"
+)
+contrast_table_null
+```
+
+## `spe_pairs`
+
+```{r}
+contrast_table_pairs <- pair_table %>%
+  transmute(
+    scenario = scenario,
+    cond_B   = cond_B,
+    type     = "control_vs_treatment"
+  )
+
+contrast_table_pairs
+```
+
+# Running Different Methods
+
+## Plain BH
+
+### `spe`
+
+```{r}
+bh_null_df <- purrr::imap_dfr(spicy_sub_list, \(sp_obj, cc) {
+  extract_leaf_stats(sp_obj, conditionB = cc) %>%
+    mutate(
+      scenario = cc,
+      reject_BH = bh_reject(pval, q = 0.05)
+    )
+})
+```
+
+### `spe_pairs`
+
+```{r}
+bh_pairs_df <- purrr::imap_dfr(spicy_pairs_sub, \(sp_obj, scenario) {
+  cond_B <- pair_table$cond_B[match(scenario, pair_table$scenario)]
+
+  extract_leaf_stats(sp_obj, conditionB = cond_B) %>%
+    mutate(
+      scenario = scenario,
+      reject_BH = bh_reject(pval, q = 0.05)
+    )
+})
+```
+
+## TreeBH
+
+```{r}
+build_treebh_inputs <- function(spicy_sub, conditionB,
+                                major_map = MAJOR_MAP,
+                                eps = 1e-12) {
+  df_leaf <- extract_leaf_stats(spicy_sub, conditionB = conditionB, eps = eps) %>%
+    tidyr::separate(leaf, into = c("a", "b"), sep = "__", remove = FALSE) %>%
+    mutate(
+      ma = unname(major_map[a]),
+      mb = unname(major_map[b]),
+      fam = canonical_pair(paste(ma, mb, sep = "__"))
+    ) %>%
+    select(leaf, fam, pval, coef)
+
+  groups <- cbind(
+    level1 = as.integer(factor(df_leaf$fam)),
+    level2 = as.integer(factor(paste(df_leaf$fam, df_leaf$leaf, sep = "/")))
+  )
+
+  list(
+    df_leaf = df_leaf,
+    pvals   = df_leaf$pval,
+    groups  = groups
+  )
+}
+
+run_treebh <- function(spicy_sub, conditionB,
+                       q = c(0.2, 0.2),
+                       major_map = MAJOR_MAP,
+                       eps = 1e-12) {
+
+  inp <- build_treebh_inputs(
+    spicy_sub  = spicy_sub,
+    conditionB = conditionB,
+    major_map  = major_map,
+    eps        = eps
+  )
+
+  res <- TreeBH::get_TreeBH_selections(
+    pvals  = inp$pvals,
+    groups = inp$groups,
+    q      = q
+  )
+
+  leaf_reject <- (res[, 2] == 1)
+
+  inp$df_leaf %>%
+    mutate(reject_TreeBH = leaf_reject)
+}
+```
+
+
+### `spe`
+
+```{r}
+treebh_null_df <- purrr::imap_dfr(spicy_sub_list, \(sp_obj, cc) {
+  run_treebh(
+    spicy_sub  = sp_obj,
+    conditionB = cc,
+    q          = c(0.2, 0.2)
+  ) %>%
+    mutate(scenario = cc)
+})
+```
+
+
+### `spe_pairs`
+
+```{r}
+treebh_pairs_df <- purrr::imap_dfr(spicy_pairs_sub, \(sp_obj, scenario) {
+  cond_B <- pair_table$cond_B[match(scenario, pair_table$scenario)]
+
+  run_treebh(
+    spicy_sub  = sp_obj,
+    conditionB = cond_B,
+    q          = c(0.2, 0.2)
+  ) %>%
+    mutate(scenario = scenario)
+})
+```
+
+## DART
+
+```{r}
+extract_leaf_for_dart <- function(spicy_sub, conditionB, eps = 1e-10) {
+  df <- extract_leaf_stats(spicy_sub, conditionB = conditionB, eps = eps) %>%
+    arrange(leaf)
+
+  list(
+    df = df,
+    pvals = setNames(df$pval, df$leaf),
+    coefs = setNames(df$coef, df$leaf)
+  )
+}
+
+make_hypothesis_distance <- function(leaf_names, major_map = MAJOR_MAP) {
+
+  cell_dist <- function(x, y) {
+    if (x == y) return(0L)
+    if (major_map[[x]] == major_map[[y]]) return(1L)
+    2L
+  }
+
+  parse_pair <- function(s) {
+    ab <- strsplit(s, "__", fixed = TRUE)[[1]]
+    ab <- sort(ab)
+    list(a = ab[1], b = ab[2])
+  }
+
+  pairs <- lapply(leaf_names, parse_pair)
+
+  m <- length(leaf_names)
+  D <- matrix(0, m, m, dimnames = list(leaf_names, leaf_names))
+
+  for (i in seq_len(m)) {
+    a <- pairs[[i]]$a; b <- pairs[[i]]$b
+    for (j in seq_len(m)) {
+      c <- pairs[[j]]$a; d <- pairs[[j]]$b
+      D[i, j] <- min(
+        cell_dist(a, c) + cell_dist(b, d),
+        cell_dist(a, d) + cell_dist(b, c)
+      )
+    }
+  }
+
+  D
+}
+
+run_dart_one <- function(spicy_sub, n_images, cond_B,
+                         alpha = 0.05,
+                         eps = 1e-10,
+                         Mgroup = 2) {
+
+  leaf <- extract_leaf_for_dart(spicy_sub, conditionB = cond_B, eps = eps)
+  pvals <- leaf$pvals
+  coefs <- leaf$coefs
+  leaf_names <- names(pvals)
+
+  D <- make_hypothesis_distance(leaf_names, major_map = MAJOR_MAP)
+  D2 <- D / max(D)
+
+  z <- qnorm(1 - as.numeric(pvals) / 2) * sign(as.numeric(coefs))
+  T1 <- matrix(z, nrow = 1)
+
+  m <- length(pvals)
+  n <- n_images
+  grids <- 16 / sqrt(n * log(m) * log(log(m)))
+
+  Atree <- DART::A.tree.mult(
+    grids  = grids,
+    Dist0  = D2,
+    Mgroup = Mgroup
+  )
+
+  res <- DART::test.mult(
+    alpha = alpha,
+    Llist = Atree$Llist,
+    Dist0 = D2,
+    T1    = T1
+  )
+
+  dart_idx <- res[[length(res)]]
+
+  dart_reject <- rep(FALSE, m)
+  if (length(dart_idx) > 0) dart_reject[dart_idx] <- TRUE
+
+  tibble(
+    leaf = leaf_names,
+    pval = as.numeric(pvals),
+    coef = as.numeric(coefs),
+    reject_DART = dart_reject
+  )
+}
+```
+
+### `spe`
+
+```{r}
+dart_null_df <- purrr::imap_dfr(spicy_sub_list, \(sp_obj, cc) {
+  run_dart_one(
+    spicy_sub = sp_obj,
+    n_images  = 200,
+    cond_B    = cc,
+    alpha     = 0.05
+  ) %>%
+    mutate(scenario = cc)
+})
+```
+
+
+### `spe_pairs`
+
+```{r}
+dart_pairs_df <- purrr::imap_dfr(spicy_pairs_sub, \(sp_obj, scenario) {
+  cond_B <- pair_table$cond_B[match(scenario, pair_table$scenario)]
+
+  run_dart_one(
+    spicy_sub = sp_obj,
+    n_images  = 200,
+    cond_B    = cond_B,
+    alpha     = 0.05
+  ) %>%
+    mutate(scenario = scenario)
+})
+```
+
+## p-filter
+
+```{r}
+extract_pfilter_inputs <- function(spicy_sub, spicy_major, cond_B, eps = 1e-12) {
+  colB <- paste0("condition", cond_B)
+
+  stopifnot(colB %in% colnames(spicy_sub$p.value))
+  stopifnot(colB %in% colnames(spicy_major$p.value))
+
+  # ---- major level (families)
+  major_df <- tibble(
+    interaction = rownames(spicy_major$p.value),
+    fam = canonical_pair(rownames(spicy_major$p.value)),
+    p_major = as.numeric(spicy_major$p.value[, colB])
+  ) %>%
+    group_by(fam) %>%
+    dplyr::slice(1) %>%
+    ungroup() %>%
+    mutate(p_major = pmin(pmax(p_major, eps), 1 - eps)) %>%
+    arrange(fam)
+
+  # ---- leaf level (subtype pairs)
+  sub_df <- tibble(
+    interaction = rownames(spicy_sub$p.value),
+    leaf = canonical_pair(rownames(spicy_sub$p.value)),
+    p_sub = as.numeric(spicy_sub$p.value[, colB])
+  ) %>%
+    group_by(leaf) %>%
+    dplyr::slice(1) %>%                 # drop A__B vs B__A duplicates
+    ungroup() %>%
+    tidyr::separate(leaf, into = c("a","b"), sep="__", remove = FALSE) %>%
+    mutate(
+      fam = canonical_pair(paste0(MAJOR_MAP[a], "__", MAJOR_MAP[b])),
+      p_sub = pmin(pmax(p_sub, eps), 1 - eps)
+    ) %>%
+    select(leaf, fam, p_sub) %>%
+    arrange(fam, leaf)
+
+  list(major_df = major_df, sub_df = sub_df)
+}
+
+
+run_pfilter_one <- function(spicy_sub, spicy_major, cond_B,
+                            alpha_major = 0.05,
+                            alpha_leaf  = 0.05,
+                            eps = 1e-12) {
+
+  inp <- extract_pfilter_inputs(spicy_sub, spicy_major, cond_B, eps = eps)
+  major_df <- inp$major_df
+  sub_df   <- inp$sub_df
+
+  n_major <- nrow(major_df)
+  n_sub   <- nrow(sub_df)
+  n_total <- n_major + n_sub
+
+  # Combine p-values in the order: majors first, then leaves
+  P_all <- c(major_df$p_major, sub_df$p_sub)
+
+  # groups matrix: n_total x 2
+  groups <- matrix(0L, nrow = n_total, ncol = 2)
+
+  # Layer 1: hierarchy constraint
+  # majors: 1..n_major
+  groups[1:n_major, 1] <- seq_len(n_major)
+
+  # leaves: inherit parent's major group
+  parent_idx <- match(sub_df$fam, major_df$fam)
+  if (anyNA(parent_idx)) {
+    stop("Some leaf families did not match any major family. Check MAJOR_MAP / canonicalization.")
+  }
+  groups[(n_major + 1):n_total, 1] <- parent_idx
+
+  # Layer 2: discovery layer (each test unique)
+  groups[, 2] <- seq_len(n_total)
+
+  # Run pfilter (from your pfilter.R)
+  res <- pfilter(
+    P      = P_all,
+    alphas = c(alpha_major, alpha_leaf),
+    groups = groups
+  )
+
+  # Extract leaf rejections (last n_sub)
+  leaf_reject <- res[(n_major + 1):n_total] == 1
+
+  # Return tidy table at leaf level
+  tibble(
+    condition = cond_B,
+    leaf      = sub_df$leaf,
+    fam       = sub_df$fam,
+    pval      = sub_df$p_sub,
+    reject    = leaf_reject
+  ) %>% arrange(fam, pval)
+}
+```
+
+
+### `spe`
+
+```{r}
+pfilter_null_df <- purrr::imap_dfr(spicy_sub_list, \(sp_sub, cc) {
+  run_pfilter_one(
+    spicy_sub   = sp_sub,
+    spicy_major = spicy_major_list[[cc]],
+    cond_B      = cc,
+    alpha_major = 0.05,
+    alpha_leaf  = 0.05
+  ) %>%
+    mutate(scenario = cc)
+})
+```
+
+
+### `spe_pairs`
+
+```{r}
+pfilter_pairs_df <- purrr::imap_dfr(spicy_pairs_sub, \(sp_sub, scenario) {
+  cond_B <- pair_table$cond_B[match(scenario, pair_table$scenario)]
+
+  run_pfilter_one(
+    spicy_sub   = sp_sub,
+    spicy_major = spicy_pairs_major[[scenario]],
+    cond_B      = cond_B,
+    alpha_major = 0.05,
+    alpha_leaf  = 0.05
+  ) %>%
+    mutate(scenario = scenario)
+})
+```
+
+## Our Method
+
+```{r}
+make_tree_df_from_spicy <- function(spicy_major, spicy_sub, cond_B, eps = 1e-12) {
+  colB <- paste0("condition", cond_B)
+
+  stopifnot(colB %in% colnames(spicy_major$p.value))
+  stopifnot(colB %in% colnames(spicy_sub$p.value))
+
+  # ---- Level 1: major families
+  maj_df <- tibble(
+    interaction = rownames(spicy_major$p.value),
+    node = canonical_pair(rownames(spicy_major$p.value)),
+    level = 1L,
+    parent = NA_character_,
+    pvalue = as.numeric(spicy_major$p.value[, colB])
+  ) %>%
+    group_by(node) %>% dplyr::slice(1) %>% ungroup() %>%   # drop duplicates after canonicalization
+    mutate(pvalue = pmin(pmax(pvalue, eps), 1 - eps)) %>%
+    select(node, level, parent, pvalue)
+
+  # ---- Level 2: subtype leaves
+  leaf_df <- tibble(
+    interaction = rownames(spicy_sub$p.value),
+    node = canonical_pair(rownames(spicy_sub$p.value)),
+    level = 2L,
+    pvalue = as.numeric(spicy_sub$p.value[, colB])
+  ) %>%
+    group_by(node) %>% dplyr::slice(1) %>% ungroup() %>%   # drop duplicates after canonicalization
+    tidyr::separate(node, into = c("a","b"), sep="__", remove = FALSE) %>%
+    mutate(
+      parent = canonical_pair(paste0(MAJOR_MAP[a], "__", MAJOR_MAP[b])),
+      pvalue = pmin(pmax(pvalue, eps), 1 - eps)
+    ) %>%
+    select(node, level, parent, pvalue)
+
+  # keep only leaves whose parent exists in major level
+  leaf_df <- leaf_df %>% filter(parent %in% maj_df$node)
+
+  bind_rows(maj_df, leaf_df) %>%
+    arrange(level, parent, node)
+}
+
+run_ours_one <- function(spicy_major, spicy_sub, cond_B, q = 0.05) {
+  tree_df <- make_tree_df_from_spicy(spicy_major, spicy_sub, cond_B)
+
+  res_ours <- run_levelwise_bh(tree_df, q = q)
+
+  leaf_df <- tree_df %>% filter(level == 2)
+
+  # vanilla BH across all leaves
+  bh_all <- bh_reject(leaf_df$pvalue, q = q)
+  bh_set <- leaf_df$node[bh_all]
+
+  our_set <- res_ours %>% filter(level == 2, reject) %>% pull(node)
+
+  list(
+    tree_df = tree_df,
+    res_ours = res_ours,
+    sig_families = res_ours %>% filter(level == 1, reject),
+    sig_leaves = res_ours %>% filter(level == 2, reject),
+    compare = list(
+      BH_all_n = length(bh_set),
+      Our_n = length(our_set),
+      overlap_n = length(intersect(bh_set, our_set)),
+      ours_only = setdiff(our_set, bh_set),
+      bh_only = setdiff(bh_set, our_set)
+    )
+  )
+}
+
+run_levelwise_bh <- function(tree_df, q = 0.05) {
+  L1 <- tree_df %>% filter(level == 1)
+  L2 <- tree_df %>% filter(level == 2)
+
+  # Level 1 BH across majors
+  L1 <- L1 %>%
+    mutate(tested = TRUE,
+           reject = bh_reject(pvalue, q))
+
+  sig_parents <- L1$node[L1$reject]
+
+  # Level 2 BH within selected major families only
+  L2 <- L2 %>%
+    mutate(tested = parent %in% sig_parents,
+           reject = FALSE)
+
+  if (any(L2$tested)) {
+    idx <- which(L2$tested)
+    L2$reject[idx] <- bh_reject(L2$pvalue[idx], q)
+  }
+
+  bind_rows(L1, L2) %>% arrange(level, parent, node)
+}
+```
+
+### `spe`
+
+```{r}
+ours_null_out <- purrr::imap(spicy_sub_list, \(sp_sub, cc) {
+  run_ours_one(
+    spicy_major = spicy_major_list[[cc]],
+    spicy_sub   = sp_sub,
+    cond_B      = cc,
+    q           = 0.05
+  )
+})
+names(ours_null_out) <- names(spicy_sub_list)
+```
+
+### `spe_pairs`
+
+```{r}
+ours_pairs_out <- purrr::imap(spicy_pairs_sub, \(sp_sub, scenario) {
+  cond_B <- pair_table$cond_B[match(scenario, pair_table$scenario)]
+
+  run_ours_one(
+    spicy_major = spicy_pairs_major[[scenario]],
+    spicy_sub   = sp_sub,
+    cond_B      = cond_B,
+    q           = 0.05
+  )
+})
+names(ours_pairs_out) <- names(spicy_pairs_sub)
+```
+
+# Exact Results 
+
+```{r}
+# -----------------------------
+# BH
+# -----------------------------
+bh_df <- bind_rows(
+  bh_null_df %>%
+    transmute(
+      scenario,
+      leaf,
+      method = "BH",
+      reject = reject_BH
+    ),
+  
+  bh_pairs_df %>%
+    transmute(
+      scenario,
+      leaf,
+      method = "BH",
+      reject = reject_BH
+    )
+)
+
+# -----------------------------
+# TreeBH
+# -----------------------------
+treebh_df <- bind_rows(
+  treebh_null_df %>%
+    transmute(
+      scenario,
+      leaf,
+      method = "TreeBH",
+      reject = reject_TreeBH
+    ),
+  
+  treebh_pairs_df %>%
+    transmute(
+      scenario,
+      leaf,
+      method = "TreeBH",
+      reject = reject_TreeBH
+    )
+)
+
+# -----------------------------
+# DART
+# -----------------------------
+dart_df <- bind_rows(
+  dart_null_df %>%
+    transmute(
+      scenario,
+      leaf,
+      method = "DART",
+      reject = reject_DART
+    ),
+  
+  dart_pairs_df %>%
+    transmute(
+      scenario,
+      leaf,
+      method = "DART",
+      reject = reject_DART
+    )
+)
+
+# -----------------------------
+# p-filter
+# -----------------------------
+pfilter_df <- bind_rows(
+  pfilter_null_df %>%
+    transmute(
+      scenario,
+      leaf,
+      method = "pfilter",
+      reject
+    ),
+  
+  pfilter_pairs_df %>%
+    transmute(
+      scenario,
+      leaf,
+      method = "pfilter",
+      reject
+    )
+)
+```
+
+```{r}
+ours_null_df <- purrr::imap_dfr(ours_null_out, function(obj, scenario) {
+  
+  obj$res_ours %>%
+    filter(level == 2) %>%
+    transmute(
+      scenario = scenario,
+      leaf = node,
+      method = "Ours",
+      reject
+    )
+})
+
+ours_pairs_df <- purrr::imap_dfr(ours_pairs_out, function(obj, scenario) {
+  
+  obj$res_ours %>%
+    filter(level == 2) %>%
+    transmute(
+      scenario = scenario,
+      leaf = node,
+      method = "Ours",
+      reject
+    )
+})
+
+ours_df <- bind_rows(ours_null_df, ours_pairs_df)
+```
+
+```{r}
+all_results <- bind_rows(
+  bh_df,
+  treebh_df,
+  dart_df,
+  pfilter_df,
+  ours_df
+)
+```
+
+```{r}
+discoveries <- all_results %>%
+  group_by(method, scenario) %>%
+  summarise(
+    n_discoveries = sum(reject),
+    .groups = "drop"
+  )
+
+discoveries
+```
+```{r}
+leaf_discoveries <- all_results %>%
+  group_by(method, scenario) %>%
+  summarise(
+    n_discoveries = sum(reject),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    signal_type = case_when(
+      str_detect(scenario, "LeafSignal|Leaf_") ~ "LeafSignal",
+      str_detect(scenario, "InternalSignal|Internal_") ~ "InternalSignal",
+      TRUE ~ "Other"
+    )
+  )
+
+
+p_leafsignal <- leaf_discoveries %>%
+  filter(signal_type == "LeafSignal") %>%
+  ggplot(aes(x = scenario, y = n_discoveries, fill = method)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Method Comparison for LeafSignal Scenarios",
+    x = "Scenario",
+    y = "Number of Discoveries"
+  )
+
+p_internalsignal <- leaf_discoveries %>%
+  filter(signal_type == "InternalSignal") %>%
+  ggplot(aes(x = scenario, y = n_discoveries, fill = method)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Method Comparison for InternalSignal Scenarios",
+    x = "Scenario",
+    y = "Number of Discoveries"
+  )
+```
+
+```{r}
+p_leafsignal
+p_internalsignal
+```
+
+
+
+
+
+```{r}
+method_agreement <- all_results %>%
+  pivot_wider(
+    names_from = method,
+    values_from = reject
+  )
+
+method_agreement %>%
+  summarise(
+    BH_vs_Ours = mean(BH == Ours),
+    TreeBH_vs_Ours = mean(TreeBH == Ours),
+    DART_vs_Ours = mean(DART == Ours),
+    pfilter_vs_Ours = mean(pfilter == Ours)
+  )
 ```
 
