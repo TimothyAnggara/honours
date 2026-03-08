@@ -82,8 +82,14 @@ finalise_cellData <- function(cellData, ids) {
     )
 }
 
-safe_bw_diggle <- function(pp, hmax = 200) {
-  bw.diggle(pp, hmax = hmax)
+safe_bw_diggle <- function(pp, hmax = 2000) {
+  bw.diggle(pp)
+}
+
+relabel_condition <- function(out, condition_name, i) {
+  out$condition <- factor(condition_name)
+  out$imageID   <- factor(paste0(condition_name, "_img_", i))
+  out
 }
 
 # -----------------------------
@@ -165,7 +171,7 @@ extract_major_pvals <- function(spicy_major, conditionB) {
 
 ```{r}
 simulate_leaf_T_to_NK <- function(i, win = WIN, total_cells = 500, w_nk = 0.70) {
-  set.seed(i)
+  # set.seed(i)
 
   props <- c(T=0.75, B=0.15, NK=0.10)
   n_T  <- rpois(1, total_cells * props["T"])
@@ -215,7 +221,7 @@ simulate_leaf_T_to_NK <- function(i, win = WIN, total_cells = 500, w_nk = 0.70) 
 
 ```{r}
 simulate_internal_T_to_NK <- function(i, win = WIN, total_cells = 500, w_nk = 0.70) {
-  set.seed(i)
+  # set.seed(i)
 
   props <- c(T=0.75, B=0.15, NK=0.10)
   n_T  <- rpois(1, total_cells * props["T"])
@@ -267,7 +273,7 @@ simulate_internal_T_to_NK <- function(i, win = WIN, total_cells = 500, w_nk = 0.
 
 ```{r}
 simulate_leaf_NK_to_CD4 <- function(i, win = WIN, total_cells = 500, w_cd4 = 0.70) {
-  set.seed(i)
+  # set.seed(i)
 
   props <- c(T=0.75, B=0.15, NK=0.10)
   n_T  <- rpois(1, total_cells * props["T"])
@@ -322,7 +328,7 @@ simulate_leaf_NK_to_CD4 <- function(i, win = WIN, total_cells = 500, w_cd4 = 0.7
 
 ```{r}
 simulate_internal_NK_to_T <- function(i, win = WIN, total_cells = 500, w_t = 0.70) {
-  set.seed(i)
+  # set.seed(i)
 
   props <- c(T=0.75, B=0.15, NK=0.10)
   n_T  <- rpois(1, total_cells * props["T"])
@@ -373,7 +379,7 @@ simulate_internal_NK_to_T <- function(i, win = WIN, total_cells = 500, w_t = 0.7
 
 ```{r}
 simulate_null <- function(i, win = WIN, total_cells = 500) {
-  set.seed(i)
+  # set.seed(i)
 
   props <- c(T=0.75, B=0.15, NK=0.10)
   n_T  <- rpois(1, total_cells * props["T"])
@@ -408,7 +414,9 @@ simulate_null <- function(i, win = WIN, total_cells = 500) {
 
 # Generate the Dataset
 
-## Creating Wrappers
+## Creating Wrappers for different spatial strength
+
+This is where we have null vs diferent spatial signal strength
 
 ### T / CD4 -> NK
 
@@ -514,10 +522,230 @@ simulate_internal_NK_to_T_strong <- function(i, win = WIN, total_cells = 500) {
 }
 ```
 
+## Generating Mixed Control and Treatment 
 
+### Leaf T / CD4 -> NK
+
+#### Control
 
 ```{r}
-N_PER_COND <- 25
+simulate_leaf_T_to_NK_control <- function(
+  i,
+  control_strength = 0.20,
+  treatment_strength = 0.50,
+  win = WIN,
+  total_cells = 500
+) {
+  out <- simulate_leaf_T_to_NK(
+    i,
+    win = win,
+    total_cells = total_cells,
+    w_nk = control_strength
+  )
+
+  condition_name <- paste0(
+    "Control_Leaf_TtoNK_",
+    gsub("\\.", "p", as.character(control_strength))
+  )
+
+  relabel_condition(out, condition_name, i)
+}
+```
+
+#### Treatment
+
+```{r}
+simulate_leaf_T_to_NK_treatment <- function(
+  i,
+  control_strength = 0.20,
+  treatment_strength = 0.50,
+  win = WIN,
+  total_cells = 500
+) {
+  out <- simulate_leaf_T_to_NK(
+    i,
+    win = win,
+    total_cells = total_cells,
+    w_nk = treatment_strength
+  )
+
+  condition_name <- paste0(
+    "Treatment_Leaf_TtoNK_",
+    gsub("\\.", "p", as.character(treatment_strength))
+  )
+
+  relabel_condition(out, condition_name, i)
+}
+```
+
+### Internal T -> NK
+
+#### Control
+
+```{r}
+simulate_internal_T_to_NK_control <- function(
+  i,
+  control_strength = 0.20,
+  treatment_strength = 0.50,
+  win = WIN,
+  total_cells = 500
+) {
+  out <- simulate_internal_T_to_NK(
+    i,
+    win = win,
+    total_cells = total_cells,
+    w_nk = control_strength
+  )
+
+  condition_name <- paste0(
+    "Control_Internal_TtoNK_",
+    gsub("\\.", "p", as.character(control_strength))
+  )
+
+  relabel_condition(out, condition_name, i)
+}
+```
+
+#### Treatment
+
+```{r}
+simulate_internal_T_to_NK_treatment <- function(
+  i,
+  control_strength = 0.20,
+  treatment_strength = 0.50,
+  win = WIN,
+  total_cells = 500
+) {
+  out <- simulate_internal_T_to_NK(
+    i,
+    win = win,
+    total_cells = total_cells,
+    w_nk = treatment_strength
+  )
+
+  condition_name <- paste0(
+    "Treatment_Internal_TtoNK_",
+    gsub("\\.", "p", as.character(treatment_strength))
+  )
+
+  relabel_condition(out, condition_name, i)
+}
+```
+
+### Leaf NK -> CD4
+
+#### Control
+
+```{r}
+simulate_leaf_NK_to_CD4_control <- function(
+  i,
+  control_strength = 0.20,
+  treatment_strength = 0.50,
+  win = WIN,
+  total_cells = 500
+) {
+  out <- simulate_leaf_NK_to_CD4(
+    i,
+    win = win,
+    total_cells = total_cells,
+    w_cd4 = control_strength
+  )
+
+  condition_name <- paste0(
+    "Control_Leaf_NKtoCD4_",
+    gsub("\\.", "p", as.character(control_strength))
+  )
+
+  relabel_condition(out, condition_name, i)
+}
+```
+
+#### Treatment
+
+```{r}
+simulate_leaf_NK_to_CD4_treatment <- function(
+  i,
+  control_strength = 0.20,
+  treatment_strength = 0.50,
+  win = WIN,
+  total_cells = 500
+) {
+  out <- simulate_leaf_NK_to_CD4(
+    i,
+    win = win,
+    total_cells = total_cells,
+    w_cd4 = treatment_strength
+  )
+
+  condition_name <- paste0(
+    "Treatment_Leaf_NKtoCD4_",
+    gsub("\\.", "p", as.character(treatment_strength))
+  )
+
+  relabel_condition(out, condition_name, i)
+}
+```
+
+### Internal NK -> T
+
+#### Control
+
+```{r}
+simulate_internal_NK_to_T_control <- function(
+  i,
+  control_strength = 0.20,
+  treatment_strength = 0.50,
+  win = WIN,
+  total_cells = 500
+) {
+  out <- simulate_internal_NK_to_T(
+    i,
+    win = win,
+    total_cells = total_cells,
+    w_t = control_strength
+  )
+
+  condition_name <- paste0(
+    "Control_Internal_NKtoT_",
+    gsub("\\.", "p", as.character(control_strength))
+  )
+
+  relabel_condition(out, condition_name, i)
+}
+```
+
+#### Treatment
+
+```{r}
+simulate_internal_NK_to_T_treatment <- function(
+  i,
+  control_strength = 0.20,
+  treatment_strength = 0.50,
+  win = WIN,
+  total_cells = 500
+) {
+  out <- simulate_internal_NK_to_T(
+    i,
+    win = win,
+    total_cells = total_cells,
+    w_t = treatment_strength
+  )
+
+  condition_name <- paste0(
+    "Treatment_Internal_NKtoT_",
+    gsub("\\.", "p", as.character(treatment_strength))
+  )
+
+  relabel_condition(out, condition_name, i)
+}
+```
+
+## Running the Simulation
+
+### Running the Null Vs. Various Spatial Strength
+
+```{r}
+N_PER_COND <- 100
 
 # cellData_all <- bind_rows(
 #   lapply(1:N_PER_COND, simulate_null),
@@ -560,6 +788,251 @@ cellData_all <- bind_rows(
 table(cellData_all$condition)
 ```
 
+#### Verifying it works
+
+```{r}
+# one row per image-condition
+img_summary <- cellData_all %>%
+  group_by(condition, imageID) %>%
+  summarise(
+    n_cells = n(),
+    n_CD4   = sum(cellType_sub == "CD4"),
+    n_CD8   = sum(cellType_sub == "CD8"),
+    n_Treg  = sum(cellType_sub == "Treg"),
+    n_B     = sum(cellType_sub == "B"),
+    n_NK    = sum(cellType_sub == "NK"),
+    xmin = min(x), xmax = max(x),
+    ymin = min(y), ymax = max(y),
+    .groups = "drop"
+  )
+
+img_summary %>%
+  group_by(condition) %>%
+  summarise(
+    n_images = n(),
+    mean_cells = mean(n_cells),
+    mean_CD4 = mean(n_CD4),
+    mean_NK  = mean(n_NK)
+  )
+
+plot_image <- function(dat, img) {
+  dat %>%
+    filter(imageID == img) %>%
+    ggplot(aes(x, y, color = cellType_sub)) +
+    geom_point(size = 1, alpha = 0.8) +
+    coord_fixed() +
+    theme_bw() +
+    ggtitle(as.character(img))
+}
+
+# example
+some_imgs <- cellData_all %>%
+  distinct(condition, imageID) %>%
+  group_by(condition) %>%
+  dplyr::slice(1) %>%
+  ungroup()
+
+plot_image(cellData_all, some_imgs$imageID[1])
+```
+
+```{r}
+mean_nn_dist <- function(dat, from_type, to_type, major = FALSE) {
+  a <- if (major) dat %>% filter(cellType_major == from_type) else dat %>% filter(cellType_sub == from_type)
+  b <- if (major) dat %>% filter(cellType_major == to_type) else dat %>% filter(cellType_sub == to_type)
+
+  if (nrow(a) == 0 || nrow(b) == 0) return(NA_real_)
+
+  XA <- cbind(a$x, a$y)
+  XB <- cbind(b$x, b$y)
+
+  dmat <- as.matrix(dist(rbind(XA, XB)))
+  na <- nrow(XA)
+  nb <- nrow(XB)
+
+  dAB <- dmat[1:na, (na + 1):(na + nb), drop = FALSE]
+  mean(apply(dAB, 1, min))
+}
+
+nn_summary <- cellData_all %>%
+  group_by(condition, imageID) %>%
+  group_modify(~{
+    dat <- .x
+    tibble(
+      CD4_to_NK = mean_nn_dist(dat, "CD4", "NK"),
+      NK_to_CD4 = mean_nn_dist(dat, "NK", "CD4"),
+      NK_to_T   = mean_nn_dist(dat, "NK", "T", major = TRUE),
+      CD8_to_NK = mean_nn_dist(dat, "CD8", "NK"),
+      Treg_to_NK = mean_nn_dist(dat, "Treg", "NK")
+    )
+  }) %>%
+  ungroup()
+
+nn_summary %>%
+  group_by(condition) %>%
+  summarise(across(c(CD4_to_NK, NK_to_CD4, NK_to_T, CD8_to_NK, Treg_to_NK), mean, na.rm = TRUE))
+
+nn_summary %>%
+  filter(str_detect(condition, "LeafSignal_TtoNK")) %>%
+  mutate(strength = case_when(
+    str_detect(condition, "weak") ~ "weak",
+    str_detect(condition, "medium") ~ "medium",
+    str_detect(condition, "strong") ~ "strong"
+  )) %>%
+  group_by(strength) %>%
+  summarise(mean_CD4_to_NK = mean(CD4_to_NK, na.rm = TRUE))
+```
+
+
+### Mixed Spatial Strength in Treatment and Control
+
+```{r}
+N_PER_COND <- 100
+
+cellData_strength_pairs <- bind_rows(
+  lapply(1:N_PER_COND, simulate_leaf_T_to_NK_control,
+         control_strength = 0.20, treatment_strength = 0.50),
+  lapply(1:N_PER_COND, simulate_leaf_T_to_NK_treatment,
+         control_strength = 0.20, treatment_strength = 0.50),
+
+  lapply(1:N_PER_COND, simulate_internal_T_to_NK_control,
+         control_strength = 0.20, treatment_strength = 0.50),
+  lapply(1:N_PER_COND, simulate_internal_T_to_NK_treatment,
+         control_strength = 0.20, treatment_strength = 0.50),
+
+  lapply(1:N_PER_COND, simulate_leaf_NK_to_CD4_control,
+         control_strength = 0.20, treatment_strength = 0.50),
+  lapply(1:N_PER_COND, simulate_leaf_NK_to_CD4_treatment,
+         control_strength = 0.20, treatment_strength = 0.50),
+
+  lapply(1:N_PER_COND, simulate_internal_NK_to_T_control,
+         control_strength = 0.20, treatment_strength = 0.50),
+  lapply(1:N_PER_COND, simulate_internal_NK_to_T_treatment,
+         control_strength = 0.20, treatment_strength = 0.50)
+)
+
+table(cellData_strength_pairs$condition)
+```
+
+#### Verifying it all works
+
+```{r}
+# one row per image-condition
+img_summary_pairs <- cellData_strength_pairs %>%
+  group_by(condition, imageID) %>%
+  summarise(
+    n_cells = n(),
+    n_CD4   = sum(cellType_sub == "CD4"),
+    n_CD8   = sum(cellType_sub == "CD8"),
+    n_Treg  = sum(cellType_sub == "Treg"),
+    n_B     = sum(cellType_sub == "B"),
+    n_NK    = sum(cellType_sub == "NK"),
+    xmin = min(x), xmax = max(x),
+    ymin = min(y), ymax = max(y),
+    .groups = "drop"
+  )
+
+# quick sanity check by condition
+img_summary_pairs %>%
+  group_by(condition) %>%
+  summarise(
+    n_images = n(),
+    mean_cells = mean(n_cells),
+    mean_CD4 = mean(n_CD4),
+    mean_NK  = mean(n_NK),
+    .groups = "drop"
+  )
+
+# plotting helper
+plot_image <- function(dat, img) {
+  dat %>%
+    filter(imageID == img) %>%
+    ggplot(aes(x, y, color = cellType_sub)) +
+    geom_point(size = 1, alpha = 0.8) +
+    coord_fixed() +
+    theme_bw() +
+    ggtitle(as.character(img))
+}
+
+# plot one example image from each condition
+some_imgs_pairs <- cellData_strength_pairs %>%
+  distinct(condition, imageID) %>%
+  group_by(condition) %>%
+  dplyr::slice(1) %>%
+  ungroup()
+
+plot_image(cellData_strength_pairs, some_imgs_pairs$imageID[1])
+
+# nearest-neighbour distance helper
+mean_nn_dist <- function(dat, from_type, to_type, major = FALSE) {
+  a <- if (major) dat %>% filter(cellType_major == from_type) else dat %>% filter(cellType_sub == from_type)
+  b <- if (major) dat %>% filter(cellType_major == to_type) else dat %>% filter(cellType_sub == to_type)
+
+  if (nrow(a) == 0 || nrow(b) == 0) return(NA_real_)
+
+  XA <- cbind(a$x, a$y)
+  XB <- cbind(b$x, b$y)
+
+  dmat <- as.matrix(dist(rbind(XA, XB)))
+  na <- nrow(XA)
+  nb <- nrow(XB)
+
+  dAB <- dmat[1:na, (na + 1):(na + nb), drop = FALSE]
+  mean(apply(dAB, 1, min))
+}
+
+# per-image NN summaries
+nn_summary_pairs <- cellData_strength_pairs %>%
+  group_by(condition, imageID) %>%
+  group_modify(~{
+    dat <- .x
+    tibble(
+      CD4_to_NK  = mean_nn_dist(dat, "CD4", "NK"),
+      NK_to_CD4  = mean_nn_dist(dat, "NK", "CD4"),
+      NK_to_T    = mean_nn_dist(dat, "NK", "T", major = TRUE),
+      CD8_to_NK  = mean_nn_dist(dat, "CD8", "NK"),
+      Treg_to_NK = mean_nn_dist(dat, "Treg", "NK")
+    )
+  }) %>%
+  ungroup()
+
+# average NN distances by condition
+nn_summary_pairs %>%
+  group_by(condition) %>%
+  summarise(
+    across(c(CD4_to_NK, NK_to_CD4, NK_to_T, CD8_to_NK, Treg_to_NK), mean, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+
+```{r}
+nn_summary_pairs_labeled <- nn_summary_pairs %>%
+  mutate(
+    scenario = case_when(
+      str_detect(condition, "Leaf_TtoNK")     ~ "Leaf_TtoNK",
+      str_detect(condition, "Internal_TtoNK") ~ "Internal_TtoNK",
+      str_detect(condition, "Leaf_NKtoCD4")   ~ "Leaf_NKtoCD4",
+      str_detect(condition, "Internal_NKtoT") ~ "Internal_NKtoT"
+    ),
+    group = case_when(
+      str_detect(condition, "^Control")   ~ "Control",
+      str_detect(condition, "^Treatment") ~ "Treatment"
+    ),
+    strength = str_extract(condition, "[0-9]p[0-9]+") %>%
+      str_replace("p", ".") %>%
+      as.numeric()
+  )
+
+nn_summary_pairs_labeled %>%
+  group_by(scenario, group, strength) %>%
+  summarise(
+    mean_CD4_to_NK = mean(CD4_to_NK, na.rm = TRUE),
+    mean_NK_to_CD4 = mean(NK_to_CD4, na.rm = TRUE),
+    mean_NK_to_T   = mean(NK_to_T, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
 # Building the SpatialExperiment
 
 ```{r}
@@ -595,8 +1068,12 @@ run_spicy_contrast <- function(spe, cond_A = "Null", cond_B, level = c("sub", "m
 # Running the Simulation
 
 ```{r}
-conds <- c("LeafSignal_TtoNK", "InternalSignal_TtoNK",
-           "LeafSignal_NKtoCD4", "InternalSignal_NKtoT")
+conds <- c(
+  "LeafSignal_TtoNK_weak",    "LeafSignal_TtoNK_medium",    "LeafSignal_TtoNK_strong",
+  "InternalSignal_TtoNK_weak","InternalSignal_TtoNK_medium","InternalSignal_TtoNK_strong",
+  "LeafSignal_NKtoCD4_weak",  "LeafSignal_NKtoCD4_medium",  "LeafSignal_NKtoCD4_strong",
+  "InternalSignal_NKtoT_weak","InternalSignal_NKtoT_medium","InternalSignal_NKtoT_strong"
+)
 
 spicy_sub_list   <- setNames(lapply(conds, \(cc) run_spicy_contrast(spe, "Null", cc, "sub")),   conds)
 spicy_major_list <- setNames(lapply(conds, \(cc) run_spicy_contrast(spe, "Null", cc, "major")), conds)
