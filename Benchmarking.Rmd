@@ -1,0 +1,152 @@
+---
+title: "Benchmarking"
+output: html_document
+date: "2026-03-08"
+---
+
+# Loading Libraries and Simulation Data
+```{r setup, include=FALSE}
+library(tidyverse)
+library(spatstat.geom)
+library(spatstat.random)
+library(spatstat.explore)
+library(SpatialExperiment)
+library(spicyR)
+library(TreeBH)
+library(DART)
+source("pfilter.R")
+```
+
+
+```{r}
+spe <- readRDS("spe.rds")
+spe_pairs <- readRDS("spe_pairs.rds")
+```
+# Helper Functions
+
+```{r}
+canonical_pair <- function(x) {
+  ab <- strsplit(x, "__", fixed = TRUE)
+  vapply(ab, function(z) paste(sort(z), collapse = "__"), character(1))
+}
+
+run_spicy_contrast <- function(spe, cond_A, cond_B, level = c("sub", "major")) {
+  level <- match.arg(level)
+  cell_col <- if (level == "sub") "cellType_sub" else "cellType_major"
+
+  spe2 <- spe[, spe$condition %in% c(cond_A, cond_B)]
+  spe2$condition <- droplevels(spe2$condition)
+  spe2$imageID   <- droplevels(spe2$imageID)
+  spe2[[cell_col]] <- droplevels(spe2[[cell_col]])
+
+  spicy(
+    spe2,
+    condition = "condition",
+    subject   = "subject",
+    cellType  = cell_col,
+    imageID   = "imageID"
+  )
+}
+```
+
+# Running spicyR 
+
+## `spe` Object
+
+```{r}
+conds <- c(
+  "LeafSignal_TtoNK_weak",     "LeafSignal_TtoNK_medium",     "LeafSignal_TtoNK_strong",
+  "InternalSignal_TtoNK_weak", "InternalSignal_TtoNK_medium", "InternalSignal_TtoNK_strong",
+  "LeafSignal_NKtoCD4_weak",   "LeafSignal_NKtoCD4_medium",   "LeafSignal_NKtoCD4_strong",
+  "InternalSignal_NKtoT_weak", "InternalSignal_NKtoT_medium", "InternalSignal_NKtoT_strong"
+)
+
+spicy_sub_list <- setNames(
+  lapply(conds, function(cc) {
+    run_spicy_contrast(
+      spe    = spe,
+      cond_A = "Null",
+      cond_B = cc,
+      level  = "sub"
+    )
+  }),
+  conds
+)
+
+spicy_major_list <- setNames(
+  lapply(conds, function(cc) {
+    run_spicy_contrast(
+      spe    = spe,
+      cond_A = "Null",
+      cond_B = cc,
+      level  = "major"
+    )
+  }),
+  conds
+)
+```
+
+## `spe_pairs`Object
+
+```{r}
+pair_table <- tibble(
+  scenario = c(
+    "Leaf_TtoNK",
+    "Internal_TtoNK",
+    "Leaf_NKtoCD4",
+    "Internal_NKtoT"
+  ),
+  cond_A = c(
+    "Control_Leaf_TtoNK_0p2",
+    "Control_Internal_TtoNK_0p2",
+    "Control_Leaf_NKtoCD4_0p2",
+    "Control_Internal_NKtoT_0p2"
+  ),
+  cond_B = c(
+    "Treatment_Leaf_TtoNK_0p5",
+    "Treatment_Internal_TtoNK_0p5",
+    "Treatment_Leaf_NKtoCD4_0p5",
+    "Treatment_Internal_NKtoT_0p5"
+  )
+)
+
+spicy_pairs_sub <- setNames(
+  lapply(seq_len(nrow(pair_table)), function(i) {
+    run_spicy_contrast(
+      spe    = spe_pairs,
+      cond_A = pair_table$cond_A[i],
+      cond_B = pair_table$cond_B[i],
+      level  = "sub"
+    )
+  }),
+  pair_table$scenario
+)
+
+spicy_pairs_major <- setNames(
+  lapply(seq_len(nrow(pair_table)), function(i) {
+    run_spicy_contrast(
+      spe    = spe_pairs,
+      cond_A = pair_table$cond_A[i],
+      cond_B = pair_table$cond_B[i],
+      level  = "major"
+    )
+  }),
+  pair_table$scenario
+)
+```
+
+```{r}
+saveRDS(spicy_sub_list, "spicy_sub_list.rds")
+saveRDS(spicy_major_list, "spicy_major_list.rds")
+```
+
+## Sanity Checks
+
+```{r}
+topPairs(spicy_sub_list[["LeafSignal_TtoNK_weak"]])
+topPairs(spicy_major_list[["LeafSignal_TtoNK_weak"]])
+
+topPairs(spicy_pairs_sub[["Leaf_TtoNK"]])
+topPairs(spicy_pairs_major[["Leaf_TtoNK"]])
+```
+

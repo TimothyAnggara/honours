@@ -1041,7 +1041,19 @@ spe <- SpatialExperiment(
   colData = cellData_all %>%
     select(imageID, subject, condition, cellType_sub, cellType_major)
 )
+
+spe_pairs <- SpatialExperiment(
+  spatialCoords = as.matrix(cellData_strength_pairs[, c("x", "y")]),
+  colData = cellData_strength_pairs %>%
+    select(imageID, subject, condition, cellType_sub, cellType_major)
+)
 ```
+
+```{r}
+saveRDS(spe, "spe.rds")
+saveRDS(spe_pairs, "spe_pairs.rds")
+```
+
 
 # running spicyR: Null vs each condition
 
