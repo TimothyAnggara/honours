@@ -253,6 +253,52 @@ bh_pairs_df <- purrr::imap_dfr(spicy_pairs_sub, \(sp_obj, scenario) {
 
 ## TreeBH
 
+TreeBH needs ONLY:
+  
+  1. Leaf p-values -> numeric vector
+  2. Tree structure -> integer matrix
+  
+TreeBH assumes that you already know the correct biological hierarchy and asks: "Given this tree, how do I control FDR?"
+
+- Internal leaves are implicitly recomputed via Simes from the leaves
+
+What is Simes? It's a way to combine several p-values into a single-value or the hypothesis "at least one of these is non-null"
+
+TreeBH instead of controlling for global FDR, it tries to control something else called sFDR where instead of controllling FDR for all the hypotheses, its conly controlling the FDR of all the hypothesis chosen and their children
+
+So how are we going to transform the tests we have into a tree?
+
+- Level 0: root 
+- Level 1: Major-Major interaction family
+  - Group by the major cell types of the pair:
+    - `T__T`
+    - `T__B`
+    - `T__NK`
+    - `B__B`
+    - `B__NK`
+    - `NK__NK`
+- Level 2: Subtype-Subtype within the family
+  - Under `T__T`
+    - `CD4__CD4`
+    - `CD4__CD8`
+    - `CD4__Treg`
+    - `CD8__CD8`
+    - `CD8__Treg`
+    - `Treg__Treg`
+  - Under `T__B`
+    - `CD4__B`
+    - `CD8__B`
+    - `Treg__B`
+  - Under `B__B`
+    - `B__B`
+  - Under `B__NK`
+    - `B__NK`
+  - Under `NK__NK`
+    - `NK__NK`
+
+Note that we have hypothesis such as `CD8__CD4` and `CD4__CD8`, we'll juts keep one of the two
+
+
 ```{r}
 build_treebh_inputs <- function(spicy_sub, conditionB,
                                 major_map = MAJOR_MAP,
@@ -334,6 +380,20 @@ treebh_pairs_df <- purrr::imap_dfr(spicy_pairs_sub, \(sp_obj, scenario) {
 ```
 
 ## DART
+
+DART composes of two stages:
+  1. Building a tree from a distance matrix between hypotheses
+  2. Tests bottom-up on the tree
+  
+Similarly to treeBH, it needs leaf hypotheses 
+
+DART assumes you don't know the hierarchy but have distances that hint at co-status and asks: "Can I learn a tree from distances and then test on it safely?"
+
+- Don't know the correct hierarchy
+- Only know pairwise distances between leaf hypotheses
+- Distance reflects likelihood for shared signal
+
+In treeBH the internal represents the hypothesis: At least one of my descendant leaf hypothesis is non-null but in DART, the internal node represents: "These leaf hypotheses are close enough (in distance) that they may share signal
 
 ```{r}
 extract_leaf_for_dart <- function(spicy_sub, conditionB, eps = 1e-10) {
@@ -590,6 +650,36 @@ pfilter_pairs_df <- purrr::imap_dfr(spicy_pairs_sub, \(sp_sub, scenario) {
 
 ## Our Method
 
+The method that we're proposing is instead of making to make our own internal p-values, we can make our own internal p-values. We can use this tree structure that we used for the treeBH example
+
+- Level 0: root 
+- Level 1: Major-Major interaction family
+  - Group by the major cell types of the pair:
+    - `T__T`
+    - `T__B`
+    - `T__NK`
+    - `B__B`
+    - `B__NK`
+    - `NK__NK`
+- Level 2: Subtype-Subtype within the damily
+  - Under `T__T`
+    - `CD4__CD4`
+    - `CD4__CD8`
+    - `CD4__Treg`
+    - `CD8__CD8`
+    - `CD8__Treg`
+    - `Treg__Treg`
+  - Under `T__B`
+    - `CD4__B`
+    - `CD8__B`
+    - `Treg__B`
+  - Under `B__B`
+    - `B__B`
+  - Under `B__NK`
+    - `B__NK`
+  - Under `NK__NK`
+    - `NK__NK`
+
 ```{r}
 make_tree_df_from_spicy <- function(spicy_major, spicy_sub, cond_B, eps = 1e-12) {
   colB <- paste0("condition", cond_B)
@@ -714,6 +804,161 @@ ours_pairs_out <- purrr::imap(spicy_pairs_sub, \(sp_sub, scenario) {
 names(ours_pairs_out) <- names(spicy_pairs_sub)
 ```
 
+## Clustering + Thinning (BY)
+
+```{r}
+extract_major_leaf_tables <- function(spicy_sub, spicy_major, cond_B, eps = 1e-12) {
+  colB <- paste0("condition", cond_B)
+
+  stopifnot(colB %in% colnames(spicy_sub$p.value))
+  stopifnot(colB %in% colnames(spicy_major$p.value))
+
+  # ---- major families
+  major_df <- tibble(
+    interaction = rownames(spicy_major$p.value),
+    fam = canonical_pair(rownames(spicy_major$p.value)),
+    p_major = as.numeric(spicy_major$p.value[, colB])
+  ) %>%
+    group_by(fam) %>%
+    dplyr::slice(1) %>%
+    ungroup() %>%
+    mutate(p_major = pmin(pmax(p_major, eps), 1 - eps)) %>%
+    arrange(fam)
+
+  # ---- leaf hypotheses
+  sub_df <- tibble(
+    interaction = rownames(spicy_sub$p.value),
+    leaf = canonical_pair(rownames(spicy_sub$p.value)),
+    p_sub = as.numeric(spicy_sub$p.value[, colB])
+  ) %>%
+    group_by(leaf) %>%
+    dplyr::slice(1) %>%
+    ungroup() %>%
+    tidyr::separate(leaf, into = c("a", "b"), sep = "__", remove = FALSE) %>%
+    mutate(
+      fam = canonical_pair(paste0(MAJOR_MAP[a], "__", MAJOR_MAP[b])),
+      p_sub = pmin(pmax(p_sub, eps), 1 - eps)
+    ) %>%
+    select(leaf, fam, p_sub) %>%
+    arrange(fam, leaf)
+
+  list(major_df = major_df, sub_df = sub_df)
+}
+
+cluster_test_major <- function(p_major, q = 0.05, method = c("BY", "BH")) {
+  method <- match.arg(method)
+
+  adj <- p.adjust(p_major, method = method)
+  sig <- adj <= q
+  sig_fams <- names(p_major)[sig]
+
+  # largest raw p-value among rejected major families
+  u1 <- if (any(sig)) max(p_major[sig]) else q
+
+  list(sig_fams = sig_fams, u1 = u1, adj = adj)
+}
+
+calculate_trimming_p <- function(z_subtype, u1_cutoff, rho = 0.5, m0_m = 0.9) {
+  num <- m0_m * pnorm((qnorm(1 - u1_cutoff) - rho * z_subtype) / sqrt(1 - rho^2))
+  den <- (m0_m * u1_cutoff + (1 - m0_m))
+  p_trim <- num / den
+  pmin(pmax(p_trim, 0), 1)
+}
+
+run_cluster_trim_one <- function(spicy_sub, spicy_major, cond_B,
+                                 q = 0.05,
+                                 major_method = c("BY", "BH"),
+                                 rho = 0.5,
+                                 m0_m = 0.9,
+                                 two_sided_z = FALSE,
+                                 eps = 1e-12) {
+
+  major_method <- match.arg(major_method)
+
+  inp <- extract_major_leaf_tables(spicy_sub, spicy_major, cond_B, eps = eps)
+  major_df <- inp$major_df
+  sub_df   <- inp$sub_df
+
+  p_major <- major_df$p_major
+  names(p_major) <- major_df$fam
+
+  # ---- Stage 1: test major families
+  maj <- cluster_test_major(p_major, q = q, method = major_method)
+  sig_fams <- maj$sig_fams
+  u1 <- maj$u1
+
+  # ---- Stage 2: trimming within selected families
+  out <- sub_df %>%
+    mutate(
+      in_sig_family = fam %in% sig_fams,
+      z_subtype = if (two_sided_z) qnorm(1 - p_sub / 2) else qnorm(1 - p_sub),
+      p_trimmed = ifelse(
+        in_sig_family,
+        vapply(
+          z_subtype,
+          calculate_trimming_p,
+          numeric(1),
+          u1_cutoff = u1,
+          rho = rho,
+          m0_m = m0_m
+        ),
+        NA_real_
+      ),
+      reject_cluster_trim = in_sig_family & !is.na(p_trimmed) & (p_trimmed <= q)
+    ) %>%
+    arrange(fam, p_sub)
+
+  list(
+    condition = cond_B,
+    sig_major_fams = sig_fams,
+    u1_cutoff = u1,
+    major_table = major_df %>% mutate(adj = maj$adj),
+    leaf_table = out
+  )
+}
+```
+
+
+### `spe`
+
+```{r}
+cluster_trim_null_out <- purrr::imap(spicy_sub_list, \(sp_sub, cc) {
+  run_cluster_trim_one(
+    spicy_sub    = sp_sub,
+    spicy_major  = spicy_major_list[[cc]],
+    cond_B       = cc,
+    q            = 0.05,
+    major_method = "BY",
+    rho          = 0.5,
+    m0_m         = 0.9,
+    two_sided_z  = FALSE
+  )
+})
+names(cluster_trim_null_out) <- names(spicy_sub_list)
+```
+
+
+### `spe_pairs`
+
+```{r}
+
+cluster_trim_pairs_out <- purrr::imap(spicy_pairs_sub, \(sp_sub, scenario) {
+  cond_B <- pair_table$cond_B[match(scenario, pair_table$scenario)]
+
+  run_cluster_trim_one(
+    spicy_sub    = sp_sub,
+    spicy_major  = spicy_pairs_major[[scenario]],
+    cond_B       = cond_B,
+    q            = 0.05,
+    major_method = "BY",
+    rho          = 0.5,
+    m0_m         = 0.9,
+    two_sided_z  = FALSE
+  )
+})
+names(cluster_trim_pairs_out) <- names(spicy_pairs_sub)
+```
+
 # Exact Results 
 
 ```{r}
@@ -723,6 +968,8 @@ names(ours_pairs_out) <- names(spicy_pairs_sub)
 bh_df <- bind_rows(
   bh_null_df %>%
     transmute(
+      dataset_type = "spe",
+      comparison_type = "Null vs Signal",
       scenario,
       leaf,
       method = "BH",
@@ -731,6 +978,8 @@ bh_df <- bind_rows(
   
   bh_pairs_df %>%
     transmute(
+      dataset_type = "spe_pairs",
+      comparison_type = "Control vs Treatment",
       scenario,
       leaf,
       method = "BH",
@@ -744,6 +993,8 @@ bh_df <- bind_rows(
 treebh_df <- bind_rows(
   treebh_null_df %>%
     transmute(
+      dataset_type = "spe",
+      comparison_type = "Null vs Signal",
       scenario,
       leaf,
       method = "TreeBH",
@@ -752,6 +1003,8 @@ treebh_df <- bind_rows(
   
   treebh_pairs_df %>%
     transmute(
+      dataset_type = "spe_pairs",
+      comparison_type = "Control vs Treatment",
       scenario,
       leaf,
       method = "TreeBH",
@@ -765,6 +1018,8 @@ treebh_df <- bind_rows(
 dart_df <- bind_rows(
   dart_null_df %>%
     transmute(
+      dataset_type = "spe",
+      comparison_type = "Null vs Signal",
       scenario,
       leaf,
       method = "DART",
@@ -773,6 +1028,8 @@ dart_df <- bind_rows(
   
   dart_pairs_df %>%
     transmute(
+      dataset_type = "spe_pairs",
+      comparison_type = "Control vs Treatment",
       scenario,
       leaf,
       method = "DART",
@@ -786,6 +1043,8 @@ dart_df <- bind_rows(
 pfilter_df <- bind_rows(
   pfilter_null_df %>%
     transmute(
+      dataset_type = "spe",
+      comparison_type = "Null vs Signal",
       scenario,
       leaf,
       method = "pfilter",
@@ -794,20 +1053,56 @@ pfilter_df <- bind_rows(
   
   pfilter_pairs_df %>%
     transmute(
+      dataset_type = "spe_pairs",
+      comparison_type = "Control vs Treatment",
       scenario,
       leaf,
       method = "pfilter",
       reject
     )
 )
-```
 
-```{r}
+# -----------------------------
+# BY
+# -----------------------------
+
+cluster_trim_null_df <- purrr::imap_dfr(cluster_trim_null_out, function(obj, scenario) {
+  obj$leaf_table %>%
+    transmute(
+      dataset_type = "spe",
+      comparison_type = "Null vs Signal",
+      scenario = scenario,
+      leaf,
+      method = "ClusterTrim_BY",
+      reject = reject_cluster_trim
+    )
+})
+
+cluster_trim_pairs_df <- purrr::imap_dfr(cluster_trim_pairs_out, function(obj, scenario) {
+  obj$leaf_table %>%
+    transmute(
+      dataset_type = "spe_pairs",
+      comparison_type = "Control vs Treatment",
+      scenario = scenario,
+      leaf,
+      method = "ClusterTrim_BY",
+      reject = reject_cluster_trim
+    )
+})
+
+cluster_trim_df <- bind_rows(cluster_trim_null_df, cluster_trim_pairs_df)
+
+
+# -----------------------------
+# Ours
+# -----------------------------
 ours_null_df <- purrr::imap_dfr(ours_null_out, function(obj, scenario) {
   
   obj$res_ours %>%
     filter(level == 2) %>%
     transmute(
+      dataset_type = "spe",
+      comparison_type = "Null vs Signal",
       scenario = scenario,
       leaf = node,
       method = "Ours",
@@ -820,6 +1115,8 @@ ours_pairs_df <- purrr::imap_dfr(ours_pairs_out, function(obj, scenario) {
   obj$res_ours %>%
     filter(level == 2) %>%
     transmute(
+      dataset_type = "spe_pairs",
+      comparison_type = "Control vs Treatment",
       scenario = scenario,
       leaf = node,
       method = "Ours",
@@ -828,6 +1125,7 @@ ours_pairs_df <- purrr::imap_dfr(ours_pairs_out, function(obj, scenario) {
 })
 
 ours_df <- bind_rows(ours_null_df, ours_pairs_df)
+
 ```
 
 ```{r}
@@ -836,13 +1134,14 @@ all_results <- bind_rows(
   treebh_df,
   dart_df,
   pfilter_df,
-  ours_df
+  ours_df,
+  cluster_trim_df
 )
 ```
 
 ```{r}
 discoveries <- all_results %>%
-  group_by(method, scenario) %>%
+  group_by(dataset_type, comparison_type, method, scenario) %>%
   summarise(
     n_discoveries = sum(reject),
     .groups = "drop"
@@ -850,69 +1149,55 @@ discoveries <- all_results %>%
 
 discoveries
 ```
+
 ```{r}
-leaf_discoveries <- all_results %>%
-  group_by(method, scenario) %>%
+summary_table <- all_results %>%
+  group_by(dataset_type, comparison_type, scenario, method) %>%
   summarise(
     n_discoveries = sum(reject),
     .groups = "drop"
   ) %>%
-  mutate(
-    signal_type = case_when(
-      str_detect(scenario, "LeafSignal|Leaf_") ~ "LeafSignal",
-      str_detect(scenario, "InternalSignal|Internal_") ~ "InternalSignal",
-      TRUE ~ "Other"
-    )
-  )
-
-
-p_leafsignal <- leaf_discoveries %>%
-  filter(signal_type == "LeafSignal") %>%
-  ggplot(aes(x = scenario, y = n_discoveries, fill = method)) +
-  geom_col(position = "dodge") +
-  coord_flip() +
-  theme_minimal() +
-  labs(
-    title = "Method Comparison for LeafSignal Scenarios",
-    x = "Scenario",
-    y = "Number of Discoveries"
-  )
-
-p_internalsignal <- leaf_discoveries %>%
-  filter(signal_type == "InternalSignal") %>%
-  ggplot(aes(x = scenario, y = n_discoveries, fill = method)) +
-  geom_col(position = "dodge") +
-  coord_flip() +
-  theme_minimal() +
-  labs(
-    title = "Method Comparison for InternalSignal Scenarios",
-    x = "Scenario",
-    y = "Number of Discoveries"
-  )
-```
-
-```{r}
-p_leafsignal
-p_internalsignal
-```
-
-
-
-
-
-```{r}
-method_agreement <- all_results %>%
   pivot_wider(
     names_from = method,
-    values_from = reject
-  )
+    values_from = n_discoveries,
+    values_fill = 0
+  ) %>%
+  arrange(dataset_type, comparison_type, scenario)
 
-method_agreement %>%
-  summarise(
-    BH_vs_Ours = mean(BH == Ours),
-    TreeBH_vs_Ours = mean(TreeBH == Ours),
-    DART_vs_Ours = mean(DART == Ours),
-    pfilter_vs_Ours = mean(pfilter == Ours)
+summary_table
+```
+
+```{r}
+discoveries %>%
+  ggplot(aes(x = scenario, y = n_discoveries, fill = method)) +
+  geom_col(position = "dodge") +
+  facet_grid(dataset_type ~ comparison_type) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "Number of Discovered Interactions by Method",
+    x = "Simulation Scenario",
+    y = "Number of Discoveries"
   )
 ```
+
+```{r}
+summary_table %>%
+  pivot_longer(
+    cols = c(BH, TreeBH, DART, pfilter, Ours),
+    names_to = "method",
+    values_to = "n_discoveries"
+  ) %>%
+  ggplot(aes(method, scenario, fill = n_discoveries)) +
+  geom_tile(color = "white") +
+  facet_grid(dataset_type ~ comparison_type) +
+  scale_fill_viridis_c() +
+  theme_bw() +
+  labs(
+    title = "Discovery Heatmap Across Methods",
+    x = "Method",
+    y = "Scenario"
+  )
+```
+
 
