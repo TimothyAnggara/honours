@@ -1,0 +1,1171 @@
+---
+title: "Simulation_Alternate"
+output: html_document
+date: "2026-03-14"
+---
+
+# Libraries
+```{r}
+library(tidyverse)
+library(spatstat.geom)
+library(spatstat.random)
+library(spatstat.explore)
+library(SpatialExperiment)
+library(purrr)
+library(dplyr)
+```
+
+# T-Cells and NK Cells
+
+```{r}
+# --------------------------------------------------
+# TREE_MAP
+#
+# Purpose:
+# This table defines the biological hierarchy for each
+# terminal cell subtype in the simulation.
+#
+# Idea:
+# Each simulated cell is usually stored using its most
+# specific label only, e.g. "CD4_T" or "Naive_B".
+#
+# This mapping table tells us which larger families that
+# subtype belongs to.
+#
+# For example:
+#   CD4_T -> T -> Lymphoid -> Immune -> Hematopoietic
+#
+# Why this is useful:
+# 1. It avoids repeating the full lineage in every row
+#    of the simulated dataset.
+# 2. It lets us recover higher-level groupings later
+#    using a join.
+# 3. It helps define the hierarchy used for multiple
+#    testing methods such as TreeBH, DART, and p-filter.
+#
+# How to use it:
+# Suppose your simulated cells look like this:
+#   x, y, cellType_sub
+#
+# Then you can attach the hierarchy with:
+#
+#   cells <- cells %>%
+#     left_join(TREE_MAP, by = c("cellType_sub" = "subtype"))
+#
+# After joining, each cell can also carry:
+TREE_MAP <- tribble(
+  ~subtype,      ~major,      ~lineage,
+  "Naive_B",     "B",         "Lymphoid",
+  "Memory_B",    "B",         "Lymphoid",
+  "CD4_T",       "T",         "Lymphoid",
+  "CD8_T",       "T",         "Lymphoid",
+  "Memory_T",    "T",         "Lymphoid",
+  "NK",          "NK",        "Lymphoid",
+  "Monocyte",    "Monocyte",  "Myeloid",
+  "M1_like",     "Macrophage","Myeloid",
+  "M2_like",     "Macrophage","Myeloid",
+  "Neutrophil",  "Granulocyte","Myeloid",
+  "Eosinophil",  "Granulocyte","Myeloid",
+  "Basophil",    "Granulocyte","Myeloid",
+  "cDC1",        "Dendritic", "Myeloid",
+  "cDC2",        "Dendritic", "Myeloid",
+  "pDC",         "Dendritic", "Myeloid",
+  "Mast",        "Mast",      "Myeloid",
+  "Fibroblast",  "Stromal",   "Stromal",
+  "Endothelial", "Stromal",   "Stromal",
+  "Pericyte",    "Stromal",   "Stromal",
+  "Epithelial",  "Tissue",    "Tissue"
+)
+
+# --------------------------------------------------
+# safe_bw_diggle()
+#
+# Purpose:
+# Compute a kernel bandwidth for a point pattern using
+# bw.diggle(), with a configurable upper search limit.
+#
+# Input:
+#   pp   = spatstat point pattern (ppp)
+#   hmax = maximum bandwidth allowed
+#
+# Output:
+#   numeric bandwidth value sigma
+# --------------------------------------------------
+safe_bw_diggle <- function(pp, hmax = 300) {
+  sigma <- bw.diggle(pp, hmax = hmax)
+  sigma
+}
+
+# --------------------------------------------------
+# choose_anchor_n()
+#
+# Purpose:
+# Choose the number of anchor points used to generate
+# a spatial density for a branch.
+#
+# Idea:
+# Anchor count is proportional to the final cell count
+# but constrained between min_n and max_n.
+#
+# Input:
+#   n_final = final cell count
+#   min_n   = minimum anchor points
+#   scale   = proportion of n_final
+#   max_n   = maximum anchor points
+#
+# Output:
+#   integer-like anchor count
+# --------------------------------------------------
+choose_anchor_n <- function(n_final, min_n = 40, scale = 0.35, max_n = 250) {
+  max(min_n, min(max_n, round(n_final * scale)))
+}
+
+# --------------------------------------------------
+# split_count()
+#
+# Purpose:
+# Split a total count n into integer subgroup counts
+# according to given proportions.
+#
+# Idea:
+# Floor the proportional counts and distribute the
+# remainder to the groups with the largest decimals.
+#
+# Input:
+#   n     = total count
+#   props = vector of proportions
+#   names = optional names for output groups
+#
+# Output:
+#   integer vector summing to n
+# --------------------------------------------------
+split_count <- function(n, props, names = NULL) {
+  raw <- n * props
+  out <- floor(raw)
+  remainder <- n - sum(out)
+
+  if (remainder > 0) {
+    add_ix <- order(raw - out, decreasing = TRUE)[seq_len(remainder)]
+    out[add_ix] <- out[add_ix] + 1
+  }
+
+  if (!is.null(names)) names(out) <- names
+  out
+}
+
+# --------------------------------------------------
+# normalize_im()
+#
+# Purpose:
+# Convert a spatial image into a proper probability density
+# so that it can be used safely in rpoint().
+# --------------------------------------------------
+normalize_im <- function(im_obj) {
+  total_mass <- integral.im(im_obj)
+  
+  if (!is.finite(total_mass) || total_mass <= 0) {
+    stop("Image cannot be normalized because total mass is not positive.")
+  }
+  
+  im_obj / total_mass
+}
+
+# --------------------------------------------------
+# label_cells()
+#
+# Purpose:
+# Convert a spatstat point pattern into a tibble and
+# assign a leaf cell type label.
+#
+# Inputs:
+#   pp           = spatstat point pattern (ppp object)
+#   cell_subtype = most specific cell label
+#
+# Output:
+#   tibble with x, y, cellType_sub
+# --------------------------------------------------
+label_cells <- function(pp, cell_subtype) {
+  if (!inherits(pp, "ppp")) {
+    stop("pp must be a spatstat point pattern object of class 'ppp'.")
+  }
+  
+  tibble(
+    x = pp$x,
+    y = pp$y,
+    cellType_sub = cell_subtype
+  )
+}
+
+# --------------------------------------------------
+# add_tree_labels()
+#
+# Purpose:
+# Use TREE_MAP to recover broader hierarchy labels
+# from the leaf subtype label.
+#
+# Inputs:
+#   cells    = tibble with a column called cellType_sub
+#   tree_map = lookup table mapping subtype to hierarchy
+#
+# Output:
+#   tibble with hierarchy columns added
+# --------------------------------------------------
+add_tree_labels <- function(cells, tree_map = TREE_MAP) {
+  if (!"cellType_sub" %in% colnames(cells)) {
+    stop("cells must contain a column called 'cellType_sub'.")
+  }
+  
+  out <- cells %>%
+    left_join(tree_map, by = c("cellType_sub" = "subtype"))
+  
+  missing_types <- out %>%
+    filter(is.na(major) | is.na(lineage)) %>%
+    distinct(cellType_sub) %>%
+    pull(cellType_sub)
+  
+  if (length(missing_types) > 0) {
+    stop(
+      paste(
+        "These subtypes are missing from TREE_MAP:",
+        paste(missing_types, collapse = ", ")
+      )
+    )
+  }
+  
+  out
+}
+
+# --------------------------------------------------
+# simulate_cells_from_density()
+#
+# Purpose:
+# Simulate n cells from a spatial density and label them
+# with a leaf subtype.
+#
+# Inputs:
+#   n            = number of cells
+#   cell_subtype = leaf cell label
+#   density      = spatstat image
+#   win          = simulation window
+#
+# Output:
+#   tibble with x, y, cellType_sub
+# --------------------------------------------------
+simulate_cells_from_density <- function(n, cell_subtype, density, win) {
+  if (n <= 0) return(NULL)
+  
+  d <- normalize_im(density)
+  pp <- rpoint(n = n, f = d, win = win)
+  
+  label_cells(pp, cell_subtype)
+}
+
+# --------------------------------------------------
+# simulate_mixture_cells()
+#
+# Purpose:
+# Simulate n cells from a mixture of two densities and
+# label them with a leaf subtype.
+#
+# Inputs:
+#   n            = number of cells
+#   cell_subtype = leaf cell label
+#   density1     = first density
+#   density2     = second density
+#   weight       = mixing weight in [0, 1]
+#   win          = simulation window
+#
+# Output:
+#   tibble with x, y, cellType_sub
+# --------------------------------------------------
+simulate_mixture_cells <- function(n, cell_subtype,
+                                   density1, density2, weight, win) {
+  if (n <= 0) return(NULL)
+  
+  if (!is.numeric(weight) || length(weight) != 1 || weight < 0 || weight > 1) {
+    stop("weight must be a single number between 0 and 1.")
+  }
+  
+  d1 <- normalize_im(density1)
+  d2 <- normalize_im(density2)
+  
+  mixed_density <- (1 - weight) * d1 + weight * d2
+  pp <- rpoint(n = n, f = mixed_density, win = win)
+  
+  label_cells(pp, cell_subtype)
+}
+
+# -------------------------------------------------- 
+# simulate_pp() 
+# 
+# Purpose: 
+# Simulate a completely spatially random point pattern 
+# inside a given window.
+# 
+# Idea: 
+# This uses a homogeneous Poisson point process, meaning: 
+# - points are placed independently of one another 
+# - every location in the window is equally likely 
+# - there is no clustering or repulsion 
+# 
+# The intensity is chosen so that the expected total number # of points in the window is n. 
+# 
+# Inputs: 
+# n = desired expected number of points 
+# win = spatstat window object defining the simulation region 
+# 
+# Output: 
+# A tibble with one row per simulated point, containing: 
+# x, y = simulated spatial coordinates 
+# 
+# Notes: 
+# - The number of simulated points is random, not fixed exactly at n 
+# - The actual number of points is Poisson distributed with mean n 
+# - This is a useful null model for complete spatial randomness 
+# -------------------------------------------------- 
+
+simulate_pp <- function(n, win) { 
+  rpoispp(n / area.owin(win), win = win) 
+}
+
+# --------------------------------------------------
+# resimulate_celltype_with_mixture()
+#
+# Purpose:
+# Post hoc resimulate one cell subtype using a mixture of:
+#   1. its own realized density
+#   2. another cell subtype's realized density
+#
+# This lets you introduce an artificial spatial signal
+# after all_cells has already been constructed.
+#
+# Inputs:
+#   all_cells     = full tibble of simulated cells
+#   target_type   = subtype to remove and resimulate
+#   partner_type  = one or more subtype labels whose
+#                   density will be mixed in
+#   weight        = mixture weight for partner density
+#   win           = spatstat window
+#   keep_metadata = if TRUE, preserve extra metadata
+#                   columns such as sample_id, condition
+#
+# Output:
+#   updated tibble with target_type resimulated
+# --------------------------------------------------
+resimulate_celltype_with_mixture <- function(
+  all_cells,
+  target_type,
+  partner_type,
+  weight,
+  win,
+  keep_metadata = TRUE
+) {
+  if (!all(c("x", "y", "cellType_sub") %in% colnames(all_cells))) {
+    stop("all_cells must contain columns: x, y, cellType_sub")
+  }
+
+  if (!is.character(target_type) || length(target_type) != 1) {
+    stop("target_type must be a single subtype name.")
+  }
+
+  if (!is.character(partner_type) || length(partner_type) < 1) {
+    stop("partner_type must be one or more subtype names.")
+  }
+
+  if (!is.numeric(weight) || length(weight) != 1 || weight < 0 || weight > 1) {
+    stop("weight must be a single number between 0 and 1.")
+  }
+
+  target_cells <- all_cells %>%
+    filter(cellType_sub == target_type)
+
+  partner_cells <- all_cells %>%
+    filter(cellType_sub %in% partner_type)
+
+  remaining_cells <- all_cells %>%
+    filter(cellType_sub != target_type)
+
+  if (nrow(target_cells) == 0) {
+    stop(paste("No cells found for target_type:", target_type))
+  }
+
+  if (nrow(partner_cells) == 0) {
+    stop(
+      paste(
+        "No cells found for partner_type:",
+        paste(partner_type, collapse = ", ")
+      )
+    )
+  }
+
+  # Convert realized cells into point patterns
+  target_pp <- ppp(
+    x = target_cells$x,
+    y = target_cells$y,
+    window = win
+  )
+
+  partner_pp <- ppp(
+    x = partner_cells$x,
+    y = partner_cells$y,
+    window = win
+  )
+
+  # Estimate realized densities using safe_bw_diggle()
+  target_density <- density.ppp(
+    target_pp,
+    sigma = safe_bw_diggle(target_pp)
+  )
+
+  partner_density <- density.ppp(
+    partner_pp,
+    sigma = safe_bw_diggle(partner_pp)
+  )
+
+  # Resimulate the target cell type from the mixture
+  target_cells_new <- simulate_mixture_cells(
+    n = nrow(target_cells),
+    cell_subtype = target_type,
+    density1 = target_density,
+    density2 = partner_density,
+    weight = weight,
+    win = win
+  )
+
+  # Rebuild dataset
+  out <- bind_rows(
+    remaining_cells %>% select(x, y, cellType_sub),
+    target_cells_new
+  ) %>%
+    add_tree_labels()
+
+  # Reattach metadata if needed
+  if (keep_metadata) {
+    meta_cols <- setdiff(
+      colnames(all_cells),
+      c("x", "y", "cellType_sub", "major", "lineage")
+    )
+
+    if (length(meta_cols) > 0) {
+      meta_template <- all_cells %>%
+        select(all_of(meta_cols))
+
+      meta_template <- meta_template[1, , drop = FALSE]
+
+      out <- bind_cols(
+        out,
+        meta_template[rep(1, nrow(out)), , drop = FALSE]
+      )
+    }
+  }
+
+  out
+}
+
+
+# --------------------------------------------------
+# make_realistic_counts()
+#
+# Purpose:
+# Generate realistic cell counts across the hierarchy
+# from a chosen total number of cells.
+#
+# Idea:
+# Split the total count step by step through the tree:
+# top level, major branches, then leaf subtypes.
+#
+# Input:
+#   total_cells = total number of cells to simulate
+#
+# Output:
+#   list containing counts for each level of the
+#   hierarchy, including final leaf cell counts
+# --------------------------------------------------
+make_realistic_counts <- function(total_cells = 5000) {
+
+  top <- split_count(
+    total_cells,
+    props = c(Immune = 0.45, Stromal = 0.25, Tissue = 0.30)
+  )
+
+  immune <- split_count(
+    top["Immune"],
+    props = c(Lymphoid = 0.55, Myeloid = 0.45)
+  )
+
+  lymphoid <- split_count(
+    immune["Lymphoid"],
+    props = c(B = 0.20, T = 0.65, NK = 0.15)
+  )
+
+  b_branch <- split_count(
+    lymphoid["B"],
+    props = c(Naive_B = 0.70, Memory_B = 0.30)
+  )
+
+  t_branch <- split_count(
+    lymphoid["T"],
+    props = c(CD4_T = 0.45, CD8_T = 0.35, Memory_T = 0.20)
+  )
+
+  myeloid <- split_count(
+    immune["Myeloid"],
+    props = c(
+      Monocyte = 0.20,
+      Macrophage = 0.25,
+      Granulocyte = 0.25,
+      Dendritic = 0.20,
+      Mast = 0.10
+    )
+  )
+
+  macrophage <- split_count(
+    myeloid["Macrophage"],
+    props = c(M1_like = 0.45, M2_like = 0.55)
+  )
+
+  granulocyte <- split_count(
+    myeloid["Granulocyte"],
+    props = c(Neutrophil = 0.70, Eosinophil = 0.20, Basophil = 0.10)
+  )
+
+  dendritic <- split_count(
+    myeloid["Dendritic"],
+    props = c(cDC1 = 0.30, cDC2 = 0.45, pDC = 0.25)
+  )
+
+  stromal <- split_count(
+    top["Stromal"],
+    props = c(Fibroblast = 0.50, Endothelial = 0.30, Pericyte = 0.20)
+  )
+
+  tissue <- c(Epithelial = top["Tissue"])
+
+  leaf_counts <- c(
+    b_branch,
+    t_branch,
+    NK = lymphoid["NK"],
+    Monocyte = myeloid["Monocyte"],
+    macrophage,
+    granulocyte,
+    dendritic,
+    Mast = myeloid["Mast"],
+    stromal,
+    tissue
+  )
+
+  list(
+    total_cells = total_cells,
+    top = top,
+    immune = immune,
+    lymphoid = lymphoid,
+    myeloid = myeloid,
+    leaf = leaf_counts
+  )
+}
+
+```
+
+# Let us Begin
+
+```{text}
+Heimatopetic
+├── Immune
+│   ├── Lymphoid
+│   │   ├── B
+│   │   │   ├── Naive_B
+│   │   │   └── Memory_B
+│   │   │ 
+│   │   ├── T
+│   │   │   ├── CD4_T
+│   │   │   ├── CD8_T
+│   │   │   └── Memory_T
+│   │   │   
+│   │   └── NK
+│   └── Myeloid
+│       ├── Monocyte
+│       ├── Macrophage
+│       │   ├── M1_like
+│       │   └── M2_like
+│       ├── Granulocyte
+│       │   ├── Neutrophil
+│       │   ├── Eosinophil
+│       │   └── Basophil
+│       ├── Dendritic
+│       │   ├── cDC1
+│       │   ├── cDC2
+│       │   └── pDC
+│       └── Mast
+├── Stromal
+│   ├── Fibroblast
+│   ├── Endothelial
+│   └── Pericyte
+└── Tissue
+    └── Epithelial
+```
+
+```{r}
+# Setting up the window
+WIN <- owin(c(0, 1000), c(0, 1000))
+
+# Main Density
+main_pp <- simulate_pp(1000, WIN)
+main_density <- density.ppp(main_pp, safe_bw_diggle(main_pp))
+
+```
+
+## Immune Layer
+```{r}
+immune_pp <- rpoint(n = 250, f = normalize_im(main_density), win = WIN)
+immune_density <- density.ppp(immune_pp, safe_bw_diggle(immune_pp))
+
+# Lympoid Density
+lymphoid_pp <- rpoint(n = 100, f = normalize_im(immune_density), win = WIN)
+lymphoid_density <- density.ppp(lymphoid_pp, safe_bw_diggle(lymphoid_pp))
+
+# Myeloid Density
+myeloid_pp <- rpoint(n = 100, f = normalize_im(immune_density), win = WIN)
+myeloid_density <- density.ppp(myeloid_pp, safe_bw_diggle(myeloid_pp))
+```
+### Lymphoid Branch
+  
+```{r}
+# ===================================
+# Lymphoid Branch
+# ===================================
+
+# B-Cell Branch
+b_pp <- rpoint(n = 100, f = normalize_im(lymphoid_density), win=WIN)
+b_density <- density.ppp(b_pp, safe_bw_diggle(b_pp))
+
+naive_b_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "Naive_B",
+  density = b_density,
+  win = WIN
+)
+
+memory_b_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "Memory_B",
+  density = b_density,
+  win = WIN
+)
+
+# T-Cell Branch
+t_pp <- rpoint(n = 100, f = normalize_im(lymphoid_density), win=WIN)
+t_density <- density.ppp(t_pp, safe_bw_diggle(t_pp))
+
+CD4_t_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "CD4_T",
+  density = t_density,
+  win = WIN
+)
+
+CD8_t_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "CD8_T",
+  density = t_density,
+  win = WIN
+)
+
+memory_t_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "Memory_T",
+  density = t_density,
+  win = WIN
+)
+
+# NK-Cell Branch
+nk_pp <- rpoint(n = 100, f = normalize_im(lymphoid_density), win = WIN)
+nk_density <- density.ppp(nk_pp, safe_bw_diggle(nk_pp))
+
+nk_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "NK",
+  density = nk_density,
+  win = WIN
+)
+
+```
+
+### Myeloid Branch
+
+```{r}
+# ===================================
+# Myeloid Branch
+# ===================================
+
+# Monocyte Branch
+monocyte_pp <- rpoint(n = 100, f = normalize_im(myeloid_density), win = WIN)
+monocyte_density <- density.ppp(monocyte_pp, safe_bw_diggle(monocyte_pp))
+
+monocyte_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "Monocyte",
+  density = monocyte_density,
+  win = WIN
+)
+
+
+# Macrophage Branch
+macrophage_pp <- rpoint(n = 100, f = normalize_im(myeloid_density), win = WIN)
+macrophage_density <- density.ppp(macrophage_pp, safe_bw_diggle(macrophage_pp))
+
+m1_like_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "M1_like",
+  density = macrophage_density,
+  win = WIN
+)
+
+m2_like_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "M2_like",
+  density = macrophage_density,
+  win = WIN
+)
+
+
+# Granulocyte Branch
+granulocyte_pp <- rpoint(n = 100, f = normalize_im(myeloid_density), win = WIN)
+granulocyte_density <- density.ppp(granulocyte_pp, safe_bw_diggle(granulocyte_pp))
+
+neutrophil_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "Neutrophil",
+  density = granulocyte_density,
+  win = WIN
+)
+
+eosinophil_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "Eosinophil",
+  density = granulocyte_density,
+  win = WIN
+)
+
+basophil_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "Basophil",
+  density = granulocyte_density,
+  win = WIN
+)
+
+
+# Dendritic Branch
+dendritic_pp <- rpoint(n = 100, f = normalize_im(myeloid_density), win = WIN)
+dendritic_density <- density.ppp(dendritic_pp, safe_bw_diggle(dendritic_pp))
+
+cdc1_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "cDC1",
+  density = dendritic_density,
+  win = WIN
+)
+
+cdc2_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "cDC2",
+  density = dendritic_density,
+  win = WIN
+)
+
+pdc_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "pDC",
+  density = dendritic_density,
+  win = WIN
+)
+
+
+# Mast Branch
+mast_pp <- rpoint(n = 100, f = normalize_im(myeloid_density), win = WIN)
+mast_density <- density.ppp(mast_pp, safe_bw_diggle(mast_pp))
+
+mast_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "Mast",
+  density = mast_density,
+  win = WIN
+)
+```
+
+
+## Stromal Layer
+
+```{r}
+# Stromal Layer
+stromal_pp <- rpoint(n = 100, f = normalize_im(main_density), win = WIN)
+stromal_density <- density.ppp(stromal_pp, safe_bw_diggle(stromal_pp))
+
+# Fibroblast Cells
+fibroblast_cells <- simulate_cells_from_density(
+  n=150,
+  cell_subtype = "Fibroblast",
+  density = stromal_density,
+  win = WIN
+)
+
+# Endothelial Cells
+endothelial_cells <- simulate_cells_from_density(
+  n=150,
+  cell_subtype = "Endothelial",
+  density = stromal_density,
+  win = WIN
+)
+
+# Pericyte Cells
+pericyte_cells <- simulate_cells_from_density(
+  n=150,
+  cell_subtype = "Pericyte",
+  density = stromal_density,
+  win = WIN
+)
+
+# Combining them all
+stromal_all <- bind_rows(
+  fibroblast_cells,
+  endothelial_cells,
+  pericyte_cells
+)
+```
+
+
+## Tissue Layer
+
+```{r}
+# Tissue Layer
+tissue_pp  <- rpoint(n = 100, f = normalize_im(main_density), win = WIN)
+tissue_density <- density.ppp(tissue_pp, safe_bw_diggle(tissue_pp))
+
+# Epithelial Cells
+epithelial_cells <- simulate_cells_from_density(
+  n = 150,
+  cell_subtype = "Epithelial",
+  density = tissue_density,
+  win = WIN
+)
+
+tissue_all <- bind_rows(
+  epithelial_cells
+)
+```
+
+# Tie Things Together
+
+```{r}
+lymphoid_all <- bind_rows(
+  naive_b_cells,
+  memory_b_cells,
+  CD4_t_cells,
+  CD8_t_cells,
+  memory_t_cells,
+  nk_cells
+)
+
+myeloid_all <- bind_rows(
+  monocyte_cells,
+  m1_like_cells,
+  m2_like_cells,
+  neutrophil_cells,
+  eosinophil_cells,
+  basophil_cells,
+  cdc1_cells,
+  cdc2_cells,
+  pdc_cells,
+  mast_cells
+)
+
+immune_all <- bind_rows(
+  lymphoid_all,
+  myeloid_all
+)
+
+all_cells <- bind_rows(
+  immune_all,
+  stromal_all,
+  tissue_all
+) %>%
+  add_tree_labels() %>%
+  mutate(
+    sample_id = "sample_1",
+    condition = "control"
+  )
+```
+
+```{r}
+ggplot(all_cells, aes(x = x, y = y, colour = cellType_sub)) +
+  geom_point(size = 0.8, alpha = 0.7) +
+  coord_equal() +
+  theme_bw()
+```
+
+# Let's try and add some signal
+
+```{r}
+all_cells_signal <- resimulate_celltype_with_mixture(
+  all_cells = all_cells,
+  target_type = "NK",
+  partner_type = c("CD4_T", "CD8_T", "Memory_T"),
+  weight = 0.7,
+  win = WIN
+)
+```
+
+
+```{r}
+# --------------------------------------------------
+# run_one_simulation()
+#
+# Purpose:
+# Simulate one spatial sample using realistic cell
+# counts and optional signal injection.
+#
+# Input:
+#   sim_id        = sample identifier
+#   win           = simulation window
+#   condition     = condition label
+#   add_signal    = logical, whether to add signal
+#   signal_weight = strength of the added signal
+#   total_cells   = total number of cells
+#
+# Output:
+#   tibble containing all simulated cells
+# --------------------------------------------------
+run_one_simulation <- function(
+  sim_id,
+  win = WIN,
+  condition = "control",
+  add_signal = FALSE,
+  signal_weight = 0.7,
+  total_cells = 5000
+) {
+
+  counts <- make_realistic_counts(total_cells)
+
+  # --------------------------------
+  # Main scaffold
+  # --------------------------------
+  main_pp <- simulate_pp(
+    n = choose_anchor_n(total_cells, min_n = 150, scale = 0.12, max_n = 500),
+    win = win
+  )
+  main_density <- density.ppp(main_pp, safe_bw_diggle(main_pp))
+
+  # --------------------------------
+  # Top-level compartments
+  # --------------------------------
+  immune_pp <- rpoint(
+    n = choose_anchor_n(counts$top["Immune"]),
+    f = normalize_im(main_density),
+    win = win
+  )
+  immune_density <- density.ppp(immune_pp, safe_bw_diggle(immune_pp))
+
+  stromal_pp <- rpoint(
+    n = choose_anchor_n(counts$top["Stromal"]),
+    f = normalize_im(main_density),
+    win = win
+  )
+  stromal_density <- density.ppp(stromal_pp, safe_bw_diggle(stromal_pp))
+
+  tissue_pp <- rpoint(
+    n = choose_anchor_n(counts$top["Tissue"]),
+    f = normalize_im(main_density),
+    win = win
+  )
+  tissue_density <- density.ppp(tissue_pp, safe_bw_diggle(tissue_pp))
+
+  # --------------------------------
+  # Immune sub-branches
+  # --------------------------------
+  lymphoid_pp <- rpoint(
+    n = choose_anchor_n(counts$immune["Lymphoid"]),
+    f = normalize_im(immune_density),
+    win = win
+  )
+  lymphoid_density <- density.ppp(lymphoid_pp, safe_bw_diggle(lymphoid_pp))
+
+  myeloid_pp <- rpoint(
+    n = choose_anchor_n(counts$immune["Myeloid"]),
+    f = normalize_im(immune_density),
+    win = win
+  )
+  myeloid_density <- density.ppp(myeloid_pp, safe_bw_diggle(myeloid_pp))
+
+  # --------------------------------
+  # Lymphoid branch
+  # --------------------------------
+  b_total <- counts$leaf["Naive_B"] + counts$leaf["Memory_B"]
+  b_pp <- rpoint(
+    n = choose_anchor_n(b_total),
+    f = normalize_im(lymphoid_density),
+    win = win
+  )
+  b_density <- density.ppp(b_pp, safe_bw_diggle(b_pp))
+
+  t_total <- counts$leaf["CD4_T"] + counts$leaf["CD8_T"] + counts$leaf["Memory_T"]
+  t_pp <- rpoint(
+    n = choose_anchor_n(t_total),
+    f = normalize_im(lymphoid_density),
+    win = win
+  )
+  t_density <- density.ppp(t_pp, safe_bw_diggle(t_pp))
+
+  nk_pp <- rpoint(
+    n = choose_anchor_n(counts$leaf["NK"]),
+    f = normalize_im(lymphoid_density),
+    win = win
+  )
+  nk_density <- density.ppp(nk_pp, safe_bw_diggle(nk_pp))
+
+  naive_b_cells <- simulate_cells_from_density(counts$leaf["Naive_B"], "Naive_B", b_density, win)
+  memory_b_cells <- simulate_cells_from_density(counts$leaf["Memory_B"], "Memory_B", b_density, win)
+
+  CD4_t_cells <- simulate_cells_from_density(counts$leaf["CD4_T"], "CD4_T", t_density, win)
+  CD8_t_cells <- simulate_cells_from_density(counts$leaf["CD8_T"], "CD8_T", t_density, win)
+  memory_t_cells <- simulate_cells_from_density(counts$leaf["Memory_T"], "Memory_T", t_density, win)
+
+  nk_cells <- simulate_cells_from_density(counts$leaf["NK"], "NK", nk_density, win)
+
+  lymphoid_all <- bind_rows(
+    naive_b_cells,
+    memory_b_cells,
+    CD4_t_cells,
+    CD8_t_cells,
+    memory_t_cells,
+    nk_cells
+  )
+
+  # --------------------------------
+  # Myeloid branch
+  # --------------------------------
+  monocyte_pp <- rpoint(
+    n = choose_anchor_n(counts$leaf["Monocyte"]),
+    f = normalize_im(myeloid_density),
+    win = win
+  )
+  monocyte_density <- density.ppp(monocyte_pp, safe_bw_diggle(monocyte_pp))
+  monocyte_cells <- simulate_cells_from_density(counts$leaf["Monocyte"], "Monocyte", monocyte_density, win)
+
+  macrophage_total <- counts$leaf["M1_like"] + counts$leaf["M2_like"]
+  macrophage_pp <- rpoint(
+    n = choose_anchor_n(macrophage_total),
+    f = normalize_im(myeloid_density),
+    win = win
+  )
+  macrophage_density <- density.ppp(macrophage_pp, safe_bw_diggle(macrophage_pp))
+  m1_like_cells <- simulate_cells_from_density(counts$leaf["M1_like"], "M1_like", macrophage_density, win)
+  m2_like_cells <- simulate_cells_from_density(counts$leaf["M2_like"], "M2_like", macrophage_density, win)
+
+  granulocyte_total <- counts$leaf["Neutrophil"] + counts$leaf["Eosinophil"] + counts$leaf["Basophil"]
+  granulocyte_pp <- rpoint(
+    n = choose_anchor_n(granulocyte_total),
+    f = normalize_im(myeloid_density),
+    win = win
+  )
+  granulocyte_density <- density.ppp(granulocyte_pp, safe_bw_diggle(granulocyte_pp))
+  neutrophil_cells <- simulate_cells_from_density(counts$leaf["Neutrophil"], "Neutrophil", granulocyte_density, win)
+  eosinophil_cells <- simulate_cells_from_density(counts$leaf["Eosinophil"], "Eosinophil", granulocyte_density, win)
+  basophil_cells <- simulate_cells_from_density(counts$leaf["Basophil"], "Basophil", granulocyte_density, win)
+
+  dendritic_total <- counts$leaf["cDC1"] + counts$leaf["cDC2"] + counts$leaf["pDC"]
+  dendritic_pp <- rpoint(
+    n = choose_anchor_n(dendritic_total),
+    f = normalize_im(myeloid_density),
+    win = win
+  )
+  dendritic_density <- density.ppp(dendritic_pp, safe_bw_diggle(dendritic_pp))
+  cdc1_cells <- simulate_cells_from_density(counts$leaf["cDC1"], "cDC1", dendritic_density, win)
+  cdc2_cells <- simulate_cells_from_density(counts$leaf["cDC2"], "cDC2", dendritic_density, win)
+  pdc_cells  <- simulate_cells_from_density(counts$leaf["pDC"], "pDC", dendritic_density, win)
+
+  mast_pp <- rpoint(
+    n = choose_anchor_n(counts$leaf["Mast"]),
+    f = normalize_im(myeloid_density),
+    win = win
+  )
+  mast_density <- density.ppp(mast_pp, safe_bw_diggle(mast_pp))
+  mast_cells <- simulate_cells_from_density(counts$leaf["Mast"], "Mast", mast_density, win)
+
+  myeloid_all <- bind_rows(
+    monocyte_cells,
+    m1_like_cells,
+    m2_like_cells,
+    neutrophil_cells,
+    eosinophil_cells,
+    basophil_cells,
+    cdc1_cells,
+    cdc2_cells,
+    pdc_cells,
+    mast_cells
+  )
+
+  # --------------------------------
+  # Stromal
+  # --------------------------------
+  fibroblast_cells <- simulate_cells_from_density(counts$leaf["Fibroblast"], "Fibroblast", stromal_density, win)
+  endothelial_cells <- simulate_cells_from_density(counts$leaf["Endothelial"], "Endothelial", stromal_density, win)
+  pericyte_cells <- simulate_cells_from_density(counts$leaf["Pericyte"], "Pericyte", stromal_density, win)
+
+  stromal_all <- bind_rows(
+    fibroblast_cells,
+    endothelial_cells,
+    pericyte_cells
+  )
+
+  # --------------------------------
+  # Tissue
+  # --------------------------------
+  epithelial_cells <- simulate_cells_from_density(counts$leaf["Epithelial"], "Epithelial", tissue_density, win)
+  tissue_all <- bind_rows(epithelial_cells)
+
+  # --------------------------------
+  # Combine
+  # --------------------------------
+  all_cells <- bind_rows(
+    lymphoid_all,
+    myeloid_all,
+    stromal_all,
+    tissue_all
+  ) %>%
+    add_tree_labels() %>%
+    mutate(
+      sample_id = paste0("sample_", sim_id),
+      condition = condition
+    )
+
+  if (add_signal) {
+    all_cells <- resimulate_celltype_with_mixture(
+      all_cells = all_cells,
+      target_type = "NK",
+      partner_type = c("CD4_T", "CD8_T", "Memory_T"),
+      weight = signal_weight,
+      win = win,
+      keep_metadata = FALSE
+    ) %>%
+      mutate(
+        sample_id = paste0("sample_", sim_id),
+        condition = condition
+      )
+  }
+
+  all_cells
+}
+```
+
+```{r}
+control_list <- map(
+  1:100,
+  ~run_one_simulation(sim_id = .x, win = WIN, condition = "control", add_signal = FALSE)
+)
+
+treat_list <- map(
+  1:100,
+  ~run_one_simulation(sim_id = .x, win = WIN, condition = "signal", add_signal = TRUE)
+)
+```
+
+

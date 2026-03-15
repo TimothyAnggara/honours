@@ -11,10 +11,6 @@ library(spatstat.geom)
 library(spatstat.random)
 library(spatstat.explore)
 library(SpatialExperiment)
-library(spicyR)
-library(TreeBH)
-library(DART)
-source("pfilter.R")
 ```
 
 # OKAY LET'S START BY WRITING THE FUNCTIONS THAT WE'LL NEED
