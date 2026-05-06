@@ -25,7 +25,117 @@ source("R/pfilter.R")
 # Benchmarking Single Sensitivity
 
 ```{r}
+# =============================================================
+# nk_t_by_survival.R
+#
+# Question: Across replications, what fraction of the time does
+# NK__T survive BY correction at the major level?
+#
+# This script assumes you have already run spicyR at the major
+# level for each replication and saved the results as a list of
+# spicy objects, e.g. spicyMajorList[[rep]].
+#
+# Adjust the loading block below to match your actual file paths.
+# =============================================================
 
+library(tidyverse)
+
+source("R/globals.R")
+source("R/benchmarking_helpers.R")
+
+TARGET_PAIR = "NK__T"   # canonical form (alphabetical)
+Q_LEVEL     = 0.05
+COND_B      = "signal"
+
+# -------------------------------------------------------------
+# 1. Load your replicated spicy-major results
+#    Replace this block with however you saved your outputs.
+#    Two common patterns are shown; uncomment the one you use.
+# -------------------------------------------------------------
+
+# Pattern A: a single .rds file containing a named list
+#   spicyMajorList = readRDS("results/spicy_major_list.rds")
+
+# Pattern B: one .rds file per replication stored in a folder
+#   rdsFiles       = list.files("results/major/", pattern = "\\.rds$",
+#                                full.names = TRUE)
+#   spicyMajorList = lapply(rdsFiles, readRDS)
+
+# For illustration, if you have a single combined results tibble
+# produced by run_all_methods(), you can instead extract the
+# ClusterTrim / Ours results directly — see the note at the end.
+
+# -------------------------------------------------------------
+# 2. Core helper: does NK__T survive BY at the major level in
+#    one spicy-major result?
+# -------------------------------------------------------------
+
+nkT_survives_by = function(spicyMajor, conditionB = COND_B,
+                            q = Q_LEVEL, target = TARGET_PAIR) {
+  majorDf = extract_major_pvals(spicyMajor, conditionB)
+
+  # BY-adjusted p-values over all major-level pairs
+  majorDf = majorDf %>%
+    mutate(p_adj_by = p.adjust(p_major, method = "BY"))
+
+  # Does the target pair appear, and is it significant?
+  row = majorDf %>% filter(fam == target)
+
+  if (nrow(row) == 0) {
+    warning(sprintf("'%s' not found in major-level results.", target))
+    return(NA)
+  }
+
+  row$p_adj_by[1] <= q
+}
+
+# -------------------------------------------------------------
+# 3. Apply across all replications
+# -------------------------------------------------------------
+rdsFiles = list.files(
+  "results/simulation/cache/single/spicy/",
+  pattern = "^w0\\.90_rep\\d+\\.rds$",
+  full.names = TRUE
+)
+
+spicyMajorList = lapply(rdsFiles, function(f) readRDS(f)$spicyMajor)
+survivalResults = tibble(
+  rep      = seq_along(spicyMajorList),
+  survives = vapply(spicyMajorList, nkT_survives_by, logical(1))
+)
+
+# -------------------------------------------------------------
+# 4. Summary
+# -------------------------------------------------------------
+
+survivalRate = mean(survivalResults$survives, na.rm = TRUE)
+nReps        = sum(!is.na(survivalResults$survives))
+
+cat(sprintf(
+  "\n'%s' survives BY correction at the major level in %d / %d replications (%.1f%%)\n\n",
+  TARGET_PAIR, sum(survivalResults$survives, na.rm = TRUE),
+  nReps, survivalRate * 100
+))
+
+print(survivalResults)
+
+# -------------------------------------------------------------
+# NOTE: If you have a combined allResults tibble from
+# run_all_methods(), the ClusterTrim and Ours methods already
+# gate through BY at the major level. You can audit their
+# gate-passing rate directly like so:
+#
+#   gateRate = allResults %>%
+#     filter(method %in% c("ClusterTrim_BY", "Ours")) %>%
+#     group_by(rep, method) %>%
+#     summarise(passed = any(reject), .groups = "drop") %>%
+#     group_by(method) %>%
+#     summarise(survivalRate = mean(passed))
+#
+# This gives the fraction of replications where *any* subtype
+# pair was detected — not directly the major-gate survival, but
+# it's a useful cross-check.
+# -------------------------------------------------------------
 ```
 
 

@@ -162,7 +162,9 @@ run_dart_one = function(spicy_sub, spe, conditionB = "signal",
   z  = qnorm(1 - as.numeric(pvals) / 2) * sign(as.numeric(coefs))
   T1 = matrix(z, nrow = 1)
   m  = length(pvals)
-  n  = length(unique(spe$imageID))
+  
+  # Fix: use number of subjects (independent units), not total images
+  n  = length(unique(spe$subject))
   
   grids = 16 / sqrt(n * log(m) * log(log(m)))
   Atree = DART::A.tree.mult(grids = grids, Dist0 = D2, Mgroup = Mgroup)
@@ -352,48 +354,152 @@ run_levelwise_bh = function(tree_df, q = 0.05, l1_method = c("BY", "BH")) {
   bind_rows(L1, L2, L3) %>% arrange(level, parent, node)
 }
 
+run_levelwise_bh_twolevel = function(major_df, sub_df, q = 0.05, l1_method = c("BY", "BH")) {
+  l1_method = match.arg(l1_method)
+  
+  # Level 1: major pairs — test all
+  L1 = major_df %>%
+    mutate(
+      tested = TRUE,
+      reject = if (l1_method == "BY") {
+        p.adjust(pvalue, method = "BY") <= q
+      } else {
+        bh_reject(pvalue, q)
+      }
+    )
+  
+  sigMajor = L1$node[L1$reject]
+  
+  # Level 2: subtype pairs — test only under rejected major parents
+  L2 = sub_df %>%
+    mutate(tested = parent %in% sigMajor, reject = FALSE)
+  
+  if (any(L2$tested)) {
+    idx = which(L2$tested)
+    L2$reject[idx] = bh_reject(L2$pvalue[idx], q)
+  }
+  
+  bind_rows(L1, L2) %>% arrange(level, parent, node)
+}
+
 run_ours_one = function(spicy_lineage, spicy_major, spicy_sub,
                         conditionB = "signal", q = 0.05,
                         l1_method = c("BY", "BH")) {
   l1_method = match.arg(l1_method)
   treeDF    = make_tree_df_from_spicy(spicy_lineage, spicy_major, spicy_sub,
                                       conditionB)
-  resOurs   = run_levelwise_bh(treeDF, q = q, l1_method = l1_method)
+  
+  majorDf  = treeDF %>% filter(level == 2)  # major pairs
+  subtypeDf = treeDF %>% filter(level == 3) # subtype pairs, already has parent column
+  
+  resOurs = run_levelwise_bh_twolevel(majorDf, subtypeDf, q = q, l1_method = l1_method)
   list(tree_df = treeDF, res_ours = resOurs)
 }
 
 # ============================================================
-# ClusterTrim (BY)
+# ClusterTrim (BY) — corrected implementation v2
+# Reference: Benjamini & Heller (2007), Procedure 4.1
 # ============================================================
+
+# --------------------------------------------------
+# cluster_test_major()
+#
+# Runs BH or BY at the major-family level and returns:
+#   sig_fams : names of significant families
+#   u1       : largest rejected raw p-value (the
+#              "cut-off point" from Procedure 4.1 step 1d)
+#   m0_m     : estimated proportion of null families,
+#              from Procedure 4.1 step 2a:
+#              m0_hat = (m - k) / (1 - q), so
+#              m0_m   = m0_hat / m = (m - k) / (m * (1 - q))
+# --------------------------------------------------
 cluster_test_major = function(p_major, q = 0.05, method = c("BY", "BH")) {
   method = match.arg(method)
   adj    = p.adjust(p_major, method = method)
   sig    = adj <= q
-  # u1 is NA when no families are significant — callers should check sig_fams
-  # before using u1, since the trimming formula is undefined in that case.
-  u1     = if (any(sig)) max(p_major[sig]) else NA_real_
-  list(sig_fams = names(p_major)[sig], u1 = u1, adj = adj)
+  m      = length(p_major)
+  k      = sum(sig)
+  
+  u1   = if (k > 0) max(p_major[sig]) else NA_real_  # restore this
+  m0_m = if (k > 0) min((m - k) / (m * (1 - q)), 1) else 1
+  
+  list(sig_fams = names(p_major)[sig], u1 = u1, m0_m = m0_m, adj = adj)
 }
 
-calculate_trimming_p = function(z_subtype, u1_cutoff, rho = 0.5, m0_m = 0.9) {
+# --------------------------------------------------
+# calculate_trimming_p()
+#
+# Implements equation (6) from Benjamini & Heller (2007)
+# under the conservative µi -> 0 approximation.
+#
+# Full equation (6):
+#
+#   pli = [m0_m * Φ̃((Φ̃⁻¹(u1) - ρ·zli) / √(1-ρ²))]
+#         / [m0_m·u1 + (1-m0_m)·Φ̃(Φ̃⁻¹(u1) - µi)]
+#
+# Conservative approximation (µi -> 0):
+#   Φ̃(Φ̃⁻¹(u1) - 0) = Φ̃(Φ̃⁻¹(u1)) = u1
+#   => denominator = m0_m·u1 + (1-m0_m)·u1 = u1
+#
+# So the conservative trimming p-value is:
+#
+#   pli = m0_m * Φ̃((Φ̃⁻¹(u1) - ρ·zli) / √(1-ρ²)) / u1
+#
+# where Φ̃ = pnorm(..., lower.tail = FALSE)
+#       Φ̃⁻¹ = qnorm(..., lower.tail = FALSE)
+#
+# Note: m0_m is now passed in from cluster_test_major()
+# rather than hardcoded, so it is estimated from data.
+# --------------------------------------------------
+calculate_trimming_p = function(z_subtype, u1_cutoff, rho, m0_m) {
+  # Φ̃⁻¹(u1): right-tail quantile
+  threshold = qnorm(u1_cutoff, lower.tail = FALSE)
+  
+  # Numerator: m0_m * Φ̃((threshold - ρ·z) / √(1-ρ²))
   num = m0_m * pnorm(
-    (qnorm(1 - u1_cutoff) - rho * z_subtype) / sqrt(1 - rho^2)
+    (threshold - rho * z_subtype) / sqrt(1 - rho^2),
+    lower.tail = FALSE
   )
-  den = m0_m * u1_cutoff + (1 - m0_m)
+  
+  # Denominator: u1 under µi -> 0 approximation
+  den = u1_cutoff
+  
   pmin(pmax(num / den, 0), 1)
 }
 
+# --------------------------------------------------
+# run_cluster_trim_one()
+#
+# Adaptation of Procedure 4.1 from Benjamini & Heller
+# (2007) to cell-type interaction pairs.
+#
+# Mapping from paper to this setting:
+#   clusters    <-> major-family interaction groups
+#   locations   <-> subtype interaction pairs within families
+#   FDRCLUST    <-> FDR on major families
+#   FDRLOC      <-> FDR on subtype pairs
+#
+# Departures from the original paper (documented):
+#   1. Two-sided tests: z_subtype uses sign(coef) to
+#      handle bidirectional interactions (co-localisation
+#      vs avoidance). The paper assumes one-sided tests.
+#   2. rho is fixed rather than estimated per family from
+#      a variogram. A single pooled value is used as an
+#      approximation since we lack the spatial coordinates
+#      needed for variogram estimation at this level.
+#   3. BH (not two-stage BH) is used in the trimming stage
+#      as a tractable approximation.
+# --------------------------------------------------
 run_cluster_trim_one = function(spicy_sub, spicy_major,
                                 conditionB   = "signal",
                                 q            = 0.05,
                                 major_method = c("BY", "BH"),
                                 rho          = 0.5,
-                                m0_m         = 0.9,
                                 eps          = 1e-12) {
   major_method = match.arg(major_method)
-  inp      = extract_pfilter_inputs(spicy_sub, spicy_major, conditionB, eps)
-  majorDf  = inp$major_df
-  subDf    = inp$sub_df
+  inp     = extract_pfilter_inputs(spicy_sub, spicy_major, conditionB, eps)
+  majorDf = inp$major_df
+  subDf   = inp$sub_df
   
   # Pull coef for sign information and join onto subDf
   leafStats = extract_leaf_stats(spicy_sub, conditionB, eps) %>%
@@ -409,19 +515,34 @@ run_cluster_trim_one = function(spicy_sub, spicy_major,
                                method = "ClusterTrim_BY", reject = FALSE))
   }
   
-  subDf %>%
+  subDf = subDf %>%
     mutate(
       in_sig_family = fam %in% maj$sig_fams,
-      # Signed z-score: distinguishes co-localisation from avoidance
-      z_subtype     = qnorm(1 - p_sub / 2) * sign(coef),
-      p_trimmed     = ifelse(
+      # Signed z-score: converts two-sided p-value to directional z.
+      # zli = Φ̃⁻¹(p̃li/2) * sign(coef) to distinguish co-localisation
+      # from avoidance. Adaptation from the paper's one-sided setting.
+      z_subtype = qnorm(1 - p_sub / 2) * sign(coef),
+      p_trimmed = ifelse(
         in_sig_family,
         vapply(z_subtype, calculate_trimming_p, numeric(1),
-               u1_cutoff = maj$u1, rho = rho, m0_m = m0_m),
+               u1_cutoff = maj$u1,
+               rho       = rho,
+               m0_m      = maj$m0_m),
         NA_real_
-      ),
-      reject = in_sig_family & !is.na(p_trimmed) & (p_trimmed <= q)
-    ) %>%
+      )
+    )
+  
+  # Trimming stage: apply BH to trimming p-values within significant
+  # families. This approximates the two-stage procedure from step 2c
+  # of Procedure 4.1 in the paper.
+  inSig     = which(subDf$in_sig_family & !is.na(subDf$p_trimmed))
+  rejectVec = rep(FALSE, nrow(subDf))
+  if (length(inSig) > 0) {
+    rejectVec[inSig] = bh_reject(subDf$p_trimmed[inSig], q = q)
+  }
+  
+  subDf %>%
+    mutate(reject = rejectVec) %>%
     transmute(leaf, pval = p_sub, method = "ClusterTrim_BY", reject)
 }
 
@@ -489,7 +610,7 @@ run_all_methods = function(spicy_sub, spicy_major, spicy_lineage, spe,
   
   # ── ClusterTrim (BY) ─────────────────────────────────────────────────
   clustertrim = tryCatch(
-    run_cluster_trim_one(spicy_sub, spicy_major),
+    run_cluster_trim_one(spicy_sub, spicy_major, major_method = "BH"),
     error = function(e) {
       message("ClusterTrim_BY failed: ", conditionMessage(e))
       extract_leaf_stats(spicy_sub) %>%

@@ -24,6 +24,28 @@ source("R/pfilter.R")
 # Set up parallel workers — adjust n_workers to however many cores you have
 n_workers = 8
 plan(multisession, workers = n_workers)
+
+# Folder for saving figures
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+
+method_order = c(
+  "Flat BH",
+  "Flat BY",
+  "TreeBH",
+  "DART",
+  "pfilter",
+  "Ours",
+  "ClusterTrim_BY"
+)
+
+plot_theme = theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(face = "bold")
+  )
 ```
 
 # Single Measure Repeated Simulation
@@ -364,6 +386,8 @@ sensitivitySingleSummary = sensitivitySingleMetrics %>%
     .groups  = "drop"
   ) %>%
   arrange(signal_weight, desc(mean_TPR))
+
+view(sensitivitySingleSummary)
 ```
 
 ---
@@ -512,37 +536,369 @@ sensitivityRepeatedSummary = sensitivityRepeatedMetrics %>%
     .groups  = "drop"
   ) %>%
   arrange(signal_weight, desc(mean_TPR))
+
+view(sensitivityRepeatedSummary)
 ```
 
 
 ---
 
-# Combined Summary Across All Scenarios
+# Sensitivity Single Summary Plots
 
 ```{r}
-# allMetrics = bind_rows(
-#   singleReplicateMetrics,
-#   repeatedReplicateMetrics,
-#   sensitivitySingleMetrics,
-#   sensitivityRepeatedMetrics
-# )
-# 
-# allSummary = allMetrics %>%
-#   group_by(method, scenario, signal_weight) %>%
-#   summarise(
-#     mean_TPR = mean(TPR, na.rm = TRUE),
-#     sd_TPR   = sd(TPR,   na.rm = TRUE),
-#     mean_FDR = mean(FDR, na.rm = TRUE),
-#     sd_FDR   = sd(FDR,   na.rm = TRUE),
-#     mean_F1  = mean(F1,  na.rm = TRUE),
-#     sd_F1    = sd(F1,    na.rm = TRUE),
-#     n_reps   = n(),
-#     .groups  = "drop"
-#   ) %>%
-#   arrange(scenario, signal_weight, desc(mean_TPR))
-# 
-# saveRDS(allSummary, "results/simulation/all_summary.rds")
+plot_df = sensitivitySingleSummary %>%
+  mutate(
+    method = factor(method, levels = method_order),
+    signal_weight = as.numeric(signal_weight),
+    se_TPR = sd_TPR / sqrt(n_reps),
+    se_FDR = sd_FDR / sqrt(n_reps),
+    se_F1  = sd_F1  / sqrt(n_reps)
+  )
+
+fig_power = ggplot(
+  plot_df,
+  aes(
+    x = signal_weight,
+    y = mean_TPR,
+    colour = method,
+    group = method
+  )
+) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.4) +
+  geom_errorbar(
+    aes(
+      ymin = pmax(mean_TPR - se_TPR, 0),
+      ymax = pmin(mean_TPR + se_TPR, 1)
+    ),
+    width = 0.025,
+    alpha = 0.6
+  ) +
+  scale_x_continuous(
+    breaks = sort(unique(plot_df$signal_weight))
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2)
+  ) +
+  labs(
+    title = "Power across increasing signal strength",
+    subtitle = "Power is measured as the true positive rate across 20 simulation replicates",
+    x = "Signal weight",
+    y = "Mean power / TPR",
+    colour = "Method"
+  ) +
+  plot_theme
+
+fig_power
+
+fig_fdr = ggplot(
+  plot_df,
+  aes(
+    x = signal_weight,
+    y = mean_FDR,
+    colour = method,
+    group = method
+  )
+) +
+  geom_hline(
+    yintercept = 0.05,
+    linetype = "dashed",
+    linewidth = 0.6
+  ) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.4) +
+  geom_errorbar(
+    aes(
+      ymin = pmax(mean_FDR - se_FDR, 0),
+      ymax = pmin(mean_FDR + se_FDR, 1)
+    ),
+    width = 0.025,
+    alpha = 0.6
+  ) +
+  scale_x_continuous(
+    breaks = sort(unique(plot_df$signal_weight))
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2)
+  ) +
+  labs(
+    title = "False discovery rate across increasing signal strength",
+    subtitle = "Dashed line shows nominal FDR level q = 0.05",
+    x = "Signal weight",
+    y = "Mean FDR",
+    colour = "Method"
+  ) +
+  plot_theme
+
+fig_fdr
+
+fig_tradeoff = ggplot(
+  plot_df,
+  aes(
+    x = mean_FDR,
+    y = mean_TPR,
+    colour = method,
+    label = signal_weight
+  )
+) +
+  geom_vline(
+    xintercept = 0.05,
+    linetype = "dashed",
+    linewidth = 0.6
+  ) +
+  geom_point(size = 2.8, alpha = 0.9) +
+  geom_text(
+    nudge_y = 0.035,
+    size = 3,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2)
+  ) +
+  labs(
+    title = "Power-FDR trade-off across methods",
+    subtitle = "Each point is one method at one signal weight; labels show signal weight",
+    x = "Mean FDR",
+    y = "Mean power / TPR",
+    colour = "Method"
+  ) +
+  plot_theme
+
+fig_tradeoff
 ```
+
+```{r}
+ggsave(
+  filename = "results/figures/power_vs_signal_single.pdf",
+  plot = fig_power,
+  width = 8,
+  height = 5
+)
+
+ggsave(
+  filename = "results/figures/power_vs_signal_single.png",
+  plot = fig_power,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  filename = "results/figures/fdr_vs_signal_single.pdf",
+  plot = fig_fdr,
+  width = 8,
+  height = 5
+)
+
+ggsave(
+  filename = "results/figures/fdr_vs_signal_single.png",
+  plot = fig_fdr,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  filename = "results/figures/power_fdr_tradeoff_single.pdf",
+  plot = fig_tradeoff,
+  width = 8,
+  height = 5
+)
+
+ggsave(
+  filename = "results/figures/power_fdr_tradeoff_single.png",
+  plot = fig_tradeoff,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+# Sensitivity Repeated Summary Plots
+
+```{r}
+plot_df = sensitivityRepeatedSummary %>%
+  mutate(
+    method = factor(method, levels = method_order),
+    signal_weight = as.numeric(signal_weight),
+    se_TPR = sd_TPR / sqrt(n_reps),
+    se_FDR = sd_FDR / sqrt(n_reps),
+    se_F1  = sd_F1  / sqrt(n_reps)
+  )
+
+fig_power = ggplot(
+  plot_df,
+  aes(
+    x = signal_weight,
+    y = mean_TPR,
+    colour = method,
+    group = method
+  )
+) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.4) +
+  geom_errorbar(
+    aes(
+      ymin = pmax(mean_TPR - se_TPR, 0),
+      ymax = pmin(mean_TPR + se_TPR, 1)
+    ),
+    width = 0.025,
+    alpha = 0.6
+  ) +
+  scale_x_continuous(
+    breaks = sort(unique(plot_df$signal_weight))
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2)
+  ) +
+  labs(
+    title = "Power across increasing signal strength",
+    subtitle = "Power is measured as the true positive rate across 20 simulation replicates",
+    x = "Signal weight",
+    y = "Mean power / TPR",
+    colour = "Method"
+  ) +
+  plot_theme
+
+fig_power
+
+fig_fdr = ggplot(
+  plot_df,
+  aes(
+    x = signal_weight,
+    y = mean_FDR,
+    colour = method,
+    group = method
+  )
+) +
+  geom_hline(
+    yintercept = 0.05,
+    linetype = "dashed",
+    linewidth = 0.6
+  ) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.4) +
+  geom_errorbar(
+    aes(
+      ymin = pmax(mean_FDR - se_FDR, 0),
+      ymax = pmin(mean_FDR + se_FDR, 1)
+    ),
+    width = 0.025,
+    alpha = 0.6
+  ) +
+  scale_x_continuous(
+    breaks = sort(unique(plot_df$signal_weight))
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2)
+  ) +
+  labs(
+    title = "False discovery rate across increasing signal strength",
+    subtitle = "Dashed line shows nominal FDR level q = 0.05",
+    x = "Signal weight",
+    y = "Mean FDR",
+    colour = "Method"
+  ) +
+  plot_theme
+
+fig_fdr
+
+fig_tradeoff = ggplot(
+  plot_df,
+  aes(
+    x = mean_FDR,
+    y = mean_TPR,
+    colour = method,
+    label = signal_weight
+  )
+) +
+  geom_vline(
+    xintercept = 0.05,
+    linetype = "dashed",
+    linewidth = 0.6
+  ) +
+  geom_point(size = 2.8, alpha = 0.9) +
+  geom_text(
+    nudge_y = 0.035,
+    size = 3,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2)
+  ) +
+  labs(
+    title = "Power-FDR trade-off across methods",
+    subtitle = "Each point is one method at one signal weight; labels show signal weight",
+    x = "Mean FDR",
+    y = "Mean power / TPR",
+    colour = "Method"
+  ) +
+  plot_theme
+
+fig_tradeoff
+```
+
+```{r}
+ggsave(
+  filename = "results/figures/power_vs_signal_repeated.pdf",
+  plot = fig_power,
+  width = 8,
+  height = 5
+)
+
+ggsave(
+  filename = "results/figures/power_vs_signal_repeated.png",
+  plot = fig_power,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  filename = "results/figures/fdr_vs_signal_repeated.pdf",
+  plot = fig_fdr,
+  width = 8,
+  height = 5
+)
+
+ggsave(
+  filename = "results/figures/fdr_vs_signal_repeated.png",
+  plot = fig_fdr,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  filename = "results/figures/power_fdr_tradeoff_repeated.pdf",
+  plot = fig_tradeoff,
+  width = 8,
+  height = 5
+)
+
+ggsave(
+  filename = "results/figures/power_fdr_tradeoff_repeated.png",
+  plot = fig_tradeoff,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
 
 # Test
 
@@ -586,4 +942,9 @@ testResult   = run_all_methods(spicySub, spicyMajor, spicyLineage, spe, TRUE_PAI
 
 glimpse(testResult$metrics)
 ```
+
+```{r}
+
+```
+
 
