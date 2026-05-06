@@ -1,0 +1,230 @@
+---
+title: "Simulation Benchmarking and Sensitivity Analysis"
+output: html_document
+params:
+  n_reps: 20
+  n_control: 10
+  n_signal: 10
+  total_cells: 5000
+  signal_weight: 0.70
+  q: 0.05
+  control_label: "control"
+  signal_label: "signal"
+  out_dir: "results"
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+
+library(tidyverse)
+library(SpatialExperiment)
+library(S4Vectors)
+library(purrr)
+library(dplyr)
+library(tibble)
+
+source("R/globals.R")
+source("R/simulation_helpers.R")
+source("R/benchmarking_helpers.R")
+
+# WIN is used by run_one_simulation() but is not defined in globals.R,
+# so define it here once.
+WIN <- spatstat.geom::owin(c(0, 1000), c(0, 1000))
+
+dir.create(params$out_dir, recursive = TRUE, showWarnings = FALSE)
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
+```
+
+# Overview
+
+This notebook does two things:
+
+1. Runs the main simulation and benchmarking workflow `r params$n_reps` times.
+2. Runs a sensitivity analysis where each scenario is also repeated `r params$n_reps` times and benchmarked.
+
+The code is written to use your existing helper files, especially:
+
+- `run_one_simulation()` from `simulation_helpers.R`
+- the benchmark helper functions from `benchmarking_helpers.R`
+
+---
+
+# Core helper functions
+
+```{r helpers}
+
+```
+
+---
+
+# Main benchmark: 20 repeated simulations
+
+```{r main-benchmark}
+main_benchmark <- run_benchmark_scenario(
+  scenario = "main",
+  n_reps = params$n_reps,
+  n_control = params$n_control,
+  n_signal = params$n_signal,
+  total_cells = params$total_cells,
+  signal_weight = params$signal_weight,
+  q = params$q
+)
+
+main_summary <- main_benchmark$summary
+main_detailed <- main_benchmark$detailed
+
+write_csv(main_summary, file.path(params$out_dir, "main_benchmark_summary.csv"))
+write_csv(main_detailed, file.path(params$out_dir, "main_benchmark_detailed.csv"))
+
+main_summary
+```
+
+## Main benchmark summary by method
+
+```{r main-summary-table}
+main_summary %>%
+  group_by(method) %>%
+  summarise(
+    mean_rejections = mean(n_reject),
+    sd_rejections   = sd(n_reject),
+    mean_power      = mean(power, na.rm = TRUE),
+    sd_power        = sd(power, na.rm = TRUE),
+    mean_fdp        = mean(fdp),
+    sd_fdp          = sd(fdp),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_power), mean_fdp)
+```
+
+## Main benchmark plots
+
+```{r main-plots}
+main_summary %>%
+  ggplot(aes(x = method, y = power)) +
+  geom_boxplot() +
+  coord_flip() +
+  theme_bw() +
+  labs(title = "Power across repeated benchmark runs", x = NULL, y = "Power")
+```
+
+```{r main-plots-fdp}
+main_summary %>%
+  ggplot(aes(x = method, y = fdp)) +
+  geom_boxplot() +
+  coord_flip() +
+  theme_bw() +
+  labs(title = "FDP across repeated benchmark runs", x = NULL, y = "False discovery proportion")
+```
+
+---
+
+# Sensitivity analysis
+
+Edit this tibble to add, remove, or change the scenarios you want to test.
+Each row is one scenario, and **each scenario is run `r params$n_reps` times**.
+
+```{r sensitivity-plan}
+sensitivity_plan <- tribble(
+  ~scenario,                ~n_control, ~n_signal, ~total_cells, ~signal_weight,
+  "baseline",                      10,        10,         5000,           0.70,
+  "weaker_signal",                 10,        10,         5000,           0.30,
+  "stronger_signal",               10,        10,         5000,           0.90,
+  "fewer_cells",                   10,        10,         3000,           0.70,
+  "more_cells",                    10,        10,         7000,           0.70,
+  "smaller_sample_size",            5,         5,         5000,           0.70,
+  "larger_sample_size",            15,        15,         5000,           0.70
+)
+
+sensitivity_plan
+```
+
+```{r run-sensitivity}
+sensitivity_results <- pmap(
+  sensitivity_plan,
+  function(scenario, n_control, n_signal, total_cells, signal_weight) {
+    run_benchmark_scenario(
+      scenario = scenario,
+      n_reps = params$n_reps,
+      n_control = n_control,
+      n_signal = n_signal,
+      total_cells = total_cells,
+      signal_weight = signal_weight,
+      q = params$q
+    )
+  }
+)
+
+names(sensitivity_results) <- sensitivity_plan$scenario
+
+sensitivity_summary <- bind_rows(map(sensitivity_results, "summary"))
+sensitivity_detailed <- bind_rows(map(sensitivity_results, "detailed"))
+
+write_csv(sensitivity_summary, file.path(params$out_dir, "sensitivity_summary.csv"))
+write_csv(sensitivity_detailed, file.path(params$out_dir, "sensitivity_detailed.csv"))
+```
+
+## Sensitivity summary table
+
+```{r sensitivity-summary-table}
+sensitivity_summary %>%
+  group_by(scenario, method) %>%
+  summarise(
+    mean_rejections = mean(n_reject),
+    mean_power      = mean(power, na.rm = TRUE),
+    mean_fdp        = mean(fdp),
+    .groups = "drop"
+  ) %>%
+  arrange(scenario, desc(mean_power), mean_fdp)
+```
+
+## Sensitivity plots
+
+```{r sensitivity-power-plot}
+sensitivity_summary %>%
+  ggplot(aes(x = scenario, y = power, fill = method)) +
+  geom_boxplot(outlier.alpha = 0.4) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Sensitivity analysis: power", x = NULL, y = "Power")
+```
+
+```{r sensitivity-fdp-plot}
+sensitivity_summary %>%
+  ggplot(aes(x = scenario, y = fdp, fill = method)) +
+  geom_boxplot(outlier.alpha = 0.4) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Sensitivity analysis: FDP", x = NULL, y = "False discovery proportion")
+```
+
+---
+
+# Save a compact comparison table
+
+```{r final-exports}
+comparison_table <- sensitivity_summary %>%
+  group_by(scenario, method) %>%
+  summarise(
+    avg_power = mean(power, na.rm = TRUE),
+    avg_fdp = mean(fdp),
+    avg_rejections = mean(n_reject),
+    .groups = "drop"
+  )
+
+write_csv(comparison_table, file.path(params$out_dir, "comparison_table.csv"))
+comparison_table
+```
+
+# Notes
+
+- The simulator currently injects signal by making **NK** cells spatially attracted to **CD4_T**, **CD8_T**, and **Memory_T**, so those three leaf interactions are treated as the ground truth positives for benchmarking.
+- Because your helper scripts do not define `WIN`, it is defined near the top of this notebook.
+- If you already have a custom `run_spicy_contrast()` helper from your older `.Rmd` files, source it before the benchmarking chunks and this notebook will use it automatically.
+- If your local `spicyR::spicy()` argument names differ from the fallback wrapper, just edit the `run_spicy_pair()` helper once and the rest of the notebook can stay the same.

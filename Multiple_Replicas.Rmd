@@ -1,0 +1,589 @@
+---
+title: "simulation_and_benchmarking"
+output: html_document
+date: "2026-03-29"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(SpatialExperiment)
+library(spatstat.geom)
+library(spatstat.random)
+library(spatstat.explore)
+library(spicyR)
+library(TreeBH)
+library(DART)
+library(purrr)
+library(dplyr)
+library(furrr)
+source("R/globals.R")
+source("R/simulation_helpers.R")
+source("R/benchmarking_helpers.R")
+source("R/pfilter.R")
+
+# Set up parallel workers — adjust n_workers to however many cores you have
+n_workers = 8
+plan(multisession, workers = n_workers)
+```
+
+# Single Measure Repeated Simulation
+
+```{r}
+run_single_measure_replicates = function(
+    n_reps        = 20,
+    n_subjects    = 50,
+    signal_weight = 0.99,
+    total_cells   = 5000,
+    win           = WIN,
+    true_pairs    = TRUE_PAIRS,
+    seed          = 42
+) {
+  set.seed(seed)
+
+  purrr::map_dfr(seq_len(n_reps), function(rep_id) {
+    message(sprintf("Running replicate %d / %d", rep_id, n_reps))
+
+    df = purrr::map_dfr(seq_len(n_subjects), function(s) {
+      controlPart = simulate_one_subject_consistent(
+        subject_id  = s,
+        n_images    = 1,
+        win         = win,
+        condition   = "control",
+        add_signal  = FALSE,
+        total_cells = total_cells
+      )
+      signalPart = simulate_one_subject_consistent(
+        subject_id    = s + n_subjects,
+        n_images      = 1,
+        win           = win,
+        condition     = "signal",
+        add_signal    = TRUE,
+        signal_weight = signal_weight,
+        total_cells   = total_cells
+      )
+      bind_rows(controlPart, signalPart)
+    })
+
+    spe        = make_spe_from_df(df)
+    spicySub     = run_spicy_contrast(spe, "control", "signal", "sub")
+    spicyMajor   = run_spicy_contrast(spe, "control", "signal", "major")
+    spicyLineage = run_spicy_contrast(spe, "control", "signal", "lineage")
+
+    out = tryCatch(
+      run_all_methods(spicySub, spicyMajor, spicyLineage, spe, true_pairs),
+      error = function(e) {
+        message(sprintf("Replicate %d failed: %s", rep_id, conditionMessage(e)))
+        NULL
+      }
+    )
+
+    if (is.null(out)) return(NULL)
+
+    out$metrics %>%
+      mutate(
+        rep_id        = rep_id,
+        scenario      = "Single measure",
+        signal_weight = signal_weight,
+        n_subjects    = n_subjects,
+        n_images      = 1
+      )
+  })
+}
+```
+
+## Running Single Measure Repeated Simulation
+
+```{r}
+# singleReplicateMetrics = run_single_measure_replicates(
+#   n_reps        = 20,
+#   n_subjects    = 50,
+#   signal_weight = 0.99
+# )
+# saveRDS(singleReplicateMetrics, "results/simulation/single_replicate_metrics.rds")
+```
+
+## Creating Metrics for the Single Measure Simulation
+
+```{r}
+# singleReplicateSummary = singleReplicateMetrics %>%
+#   group_by(method) %>%
+#   summarise(
+#     mean_TPR = mean(TPR, na.rm = TRUE),
+#     sd_TPR   = sd(TPR,   na.rm = TRUE),
+#     mean_FDR = mean(FDR, na.rm = TRUE),
+#     sd_FDR   = sd(FDR,   na.rm = TRUE),
+#     mean_F1  = mean(F1,  na.rm = TRUE),
+#     sd_F1    = sd(F1,    na.rm = TRUE),
+#     n_reps   = n(),
+#     .groups  = "drop"
+#   ) %>%
+#   arrange(desc(mean_TPR))
+```
+
+---
+
+# Repeated Measure Simulation
+
+```{r}
+run_repeated_measure_replicates = function(
+    n_reps        = 20,
+    n_subjects    = 50,
+    n_images      = 5,
+    signal_weight = 0.99,
+    total_cells   = 5000,
+    win           = WIN,
+    true_pairs    = TRUE_PAIRS,
+    seed          = 42
+) {
+  set.seed(seed)
+
+  purrr::map_dfr(seq_len(n_reps), function(rep_id) {
+    message(sprintf("Running replicate %d / %d", rep_id, n_reps))
+
+    df = purrr::map_dfr(seq_len(n_subjects), function(s) {
+      controlPart = simulate_one_subject_consistent(
+        subject_id  = s,
+        n_images    = n_images,
+        win         = win,
+        condition   = "control",
+        add_signal  = FALSE,
+        total_cells = total_cells
+      )
+      signalPart = simulate_one_subject_consistent(
+        subject_id    = s + n_subjects,
+        n_images      = n_images,
+        win           = win,
+        condition     = "signal",
+        add_signal    = TRUE,
+        signal_weight = signal_weight,
+        total_cells   = total_cells
+      )
+      bind_rows(controlPart, signalPart)
+    })
+
+    spe        = make_spe_from_df(df)
+    spicySub     = run_spicy_contrast(spe, "control", "signal", "sub")
+    spicyMajor   = run_spicy_contrast(spe, "control", "signal", "major")
+    spicyLineage = run_spicy_contrast(spe, "control", "signal", "lineage")
+
+    out = tryCatch(
+      run_all_methods(spicySub, spicyMajor, spicyLineage, spe, true_pairs),
+      error = function(e) {
+        message(sprintf("Replicate %d failed: %s", rep_id, conditionMessage(e)))
+        NULL
+      }
+    )
+
+    if (is.null(out)) return(NULL)
+
+    out$metrics %>%
+      mutate(
+        rep_id        = rep_id,
+        scenario      = "Repeated measure",
+        signal_weight = signal_weight,
+        n_subjects    = n_subjects,
+        n_images      = n_images
+      )
+  })
+}
+```
+
+## Running Repeated Measure Simulation
+
+```{r}
+# repeatedReplicateMetrics = run_repeated_measure_replicates(
+#   n_reps        = 20,
+#   n_subjects    = 50,
+#   n_images      = 5,
+#   signal_weight = 0.99
+# )
+# saveRDS(repeatedReplicateMetrics, "results/simulation/repeated_replicate_metrics.rds")
+```
+
+## Creating Metrics for the Repeated Measure Simulation
+
+```{r}
+# repeatedReplicateSummary = repeatedReplicateMetrics %>%
+#   group_by(method) %>%
+#   summarise(
+#     mean_TPR = mean(TPR, na.rm = TRUE),
+#     sd_TPR   = sd(TPR,   na.rm = TRUE),
+#     mean_FDR = mean(FDR, na.rm = TRUE),
+#     sd_FDR   = sd(FDR,   na.rm = TRUE),
+#     mean_F1  = mean(F1,  na.rm = TRUE),
+#     sd_F1    = sd(F1,    na.rm = TRUE),
+#     n_reps   = n(),
+#     .groups  = "drop"
+#   ) %>%
+#   arrange(desc(mean_TPR))
+```
+
+---
+
+# Sensitivity Analysis
+
+## Single Measure Sensitivity
+
+```{r}
+run_sensitivity_single = function(
+    n_reps         = 20,
+    n_subjects     = 50,
+    signal_weights = c(0.30, 0.50, 0.70, 0.90, 0.99),
+    total_cells    = 10000,
+    win            = WIN,
+    true_pairs     = TRUE_PAIRS,
+    cache_dir      = "results/simulation/cache/single"
+) {
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(cache_dir, "spe"),     recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(cache_dir, "spicy"),   recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(cache_dir, "metrics"), recursive = TRUE, showWarnings = FALSE)
+
+  purrr::map_dfr(signal_weights, function(w) {
+    message(sprintf("Running signal weight %.2f", w))
+    furrr::future_map_dfr(seq_len(n_reps), function(rep_id) {
+      wd = getwd()
+      source(file.path(wd, "R/globals.R"))
+      source(file.path(wd, "R/simulation_helpers.R"))
+      source(file.path(wd, "R/benchmarking_helpers.R"))
+      source(file.path(wd, "R/pfilter.R"))
+
+      stub        = sprintf("w%.2f_rep%03d", w, rep_id)
+      speFile     = file.path(cache_dir, "spe",     paste0(stub, ".rds"))
+      spicyFile   = file.path(cache_dir, "spicy",   paste0(stub, ".rds"))
+      metricsFile = file.path(cache_dir, "metrics", paste0(stub, ".rds"))
+
+      # ── metrics already done ──────────────────────────────────────────
+      if (file.exists(metricsFile)) {
+        message(sprintf("  Replicate %d (weight %.2f) metrics loaded from cache", rep_id, w))
+        return(readRDS(metricsFile))
+      }
+
+      # ── simulate data (or load) ───────────────────────────────────────
+      if (file.exists(speFile)) {
+        message(sprintf("  Replicate %d (weight %.2f) SPE loaded from cache", rep_id, w))
+        spe = readRDS(speFile)
+      } else {
+        message(sprintf("  Replicate %d / %d — simulating", rep_id, n_reps))
+        df = purrr::map_dfr(seq_len(n_subjects), function(s) {
+          controlPart = simulate_one_subject_consistent(
+            subject_id  = s,
+            n_images    = 1,
+            win         = win,
+            condition   = "control",
+            add_signal  = FALSE,
+            total_cells = total_cells
+          )
+          signalPart = simulate_one_subject_consistent(
+            subject_id    = s + n_subjects,
+            n_images      = 1,
+            win           = win,
+            condition     = "signal",
+            add_signal    = TRUE,
+            signal_weight = w,
+            total_cells   = total_cells
+          )
+          bind_rows(controlPart, signalPart)
+        })
+        spe = make_spe_from_df(df)
+        saveRDS(spe, speFile)
+        rm(df)
+      }
+
+      # ── spicyR (or load) ──────────────────────────────────────────────
+      if (file.exists(spicyFile)) {
+        message(sprintf("  Replicate %d (weight %.2f) spicy loaded from cache", rep_id, w))
+        spicyCache   = readRDS(spicyFile)
+        spicySub     = spicyCache$spicySub
+        spicyMajor   = spicyCache$spicyMajor
+        spicyLineage = spicyCache$spicyLineage
+      } else {
+        message(sprintf("  Replicate %d / %d — running spicyR", rep_id, n_reps))
+        spicySub     = run_spicy_contrast(spe, "control", "signal", "sub",     cores = 8)
+        spicyMajor   = run_spicy_contrast(spe, "control", "signal", "major",   cores = 8)
+        spicyLineage = run_spicy_contrast(spe, "control", "signal", "lineage", cores = 8)
+        saveRDS(
+          list(spicySub = spicySub, spicyMajor = spicyMajor,
+               spicyLineage = spicyLineage),
+          spicyFile
+        )
+      }
+
+      # ── run methods ───────────────────────────────────────────────────
+      result = tryCatch(
+        run_all_methods(spicySub, spicyMajor, spicyLineage, spe, true_pairs),
+        error = function(e) {
+          message(sprintf("  Replicate %d (weight %.2f) failed: %s",
+                          rep_id, w, conditionMessage(e)))
+          NULL
+        }
+      )
+      if (is.null(result)) return(NULL)
+
+      out = result$metrics %>%
+        mutate(
+          rep_id        = rep_id,
+          scenario      = "Sensitivity - Single measure",
+          signal_weight = w,
+          n_subjects    = n_subjects,
+          n_images      = 1
+        )
+      saveRDS(out, metricsFile)
+      rm(spe, spicySub, spicyMajor, spicyLineage, result)
+      gc()
+      out
+    }, .options = furrr_options(seed = TRUE))
+  })
+}
+```
+
+### Running Single Measure Sensitivity
+
+```{r}
+sensitivitySingleMetrics = run_sensitivity_single(
+  n_reps         = 20,
+  n_subjects     = 50,
+  signal_weights = c(0.30, 0.50, 0.70, 0.90, 0.99)
+)
+saveRDS(sensitivitySingleMetrics, "results/simulation/sensitivity_single_metrics.rds")
+```
+
+### Creating Metrics for the Single Measure Sensitivity
+
+```{r}
+sensitivitySingleSummary = sensitivitySingleMetrics %>%
+  group_by(method, signal_weight) %>%
+  summarise(
+    mean_TPR = mean(TPR, na.rm = TRUE),
+    sd_TPR   = sd(TPR,   na.rm = TRUE),
+    mean_FDR = mean(FDR, na.rm = TRUE),
+    sd_FDR   = sd(FDR,   na.rm = TRUE),
+    mean_F1  = mean(F1,  na.rm = TRUE),
+    sd_F1    = sd(F1,    na.rm = TRUE),
+    n_reps   = n(),
+    .groups  = "drop"
+  ) %>%
+  arrange(signal_weight, desc(mean_TPR))
+```
+
+---
+
+## Repeated Measure Sensitivity
+
+```{r}
+run_sensitivity_repeated = function(
+    n_reps         = 20,
+    n_subjects     = 50,
+    n_images       = 5,
+    signal_weights = c(0.30, 0.50, 0.70, 0.90, 0.99),
+    total_cells    = 10000,
+    win            = WIN,
+    true_pairs     = TRUE_PAIRS,
+    cache_dir      = "results/simulation/cache/repeated"
+) {
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(cache_dir, "spe"),     recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(cache_dir, "spicy"),   recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(cache_dir, "metrics"), recursive = TRUE, showWarnings = FALSE)
+
+  purrr::map_dfr(signal_weights, function(w) {
+    message(sprintf("Running signal weight %.2f", w))
+    furrr::future_map_dfr(seq_len(n_reps), function(rep_id) {
+      wd = getwd()
+      source(file.path(wd, "R/globals.R"))
+      source(file.path(wd, "R/simulation_helpers.R"))
+      source(file.path(wd, "R/benchmarking_helpers.R"))
+      source(file.path(wd, "R/pfilter.R"))
+
+      stub        = sprintf("w%.2f_rep%03d", w, rep_id)
+      speFile     = file.path(cache_dir, "spe",     paste0(stub, ".rds"))
+      spicyFile   = file.path(cache_dir, "spicy",   paste0(stub, ".rds"))
+      metricsFile = file.path(cache_dir, "metrics", paste0(stub, ".rds"))
+
+      # ── metrics already done ──────────────────────────────────────────
+      if (file.exists(metricsFile)) {
+        message(sprintf("  Replicate %d (weight %.2f) metrics loaded from cache", rep_id, w))
+        return(readRDS(metricsFile))
+      }
+
+      # ── simulate data (or load) ───────────────────────────────────────
+      if (file.exists(speFile)) {
+        message(sprintf("  Replicate %d (weight %.2f) SPE loaded from cache", rep_id, w))
+        spe = readRDS(speFile)
+      } else {
+        message(sprintf("  Replicate %d / %d — simulating", rep_id, n_reps))
+        df = purrr::map_dfr(seq_len(n_subjects), function(s) {
+          controlPart = simulate_one_subject_consistent(
+            subject_id  = s,
+            n_images    = n_images,
+            win         = win,
+            condition   = "control",
+            add_signal  = FALSE,
+            total_cells = total_cells
+          )
+          signalPart = simulate_one_subject_consistent(
+            subject_id    = s + n_subjects,
+            n_images      = n_images,
+            win           = win,
+            condition     = "signal",
+            add_signal    = TRUE,
+            signal_weight = w,
+            total_cells   = total_cells
+          )
+          bind_rows(controlPart, signalPart)
+        })
+        spe = make_spe_from_df(df)
+        saveRDS(spe, speFile)
+        rm(df)
+      }
+
+      # ── spicyR (or load) ──────────────────────────────────────────────
+      if (file.exists(spicyFile)) {
+        message(sprintf("  Replicate %d (weight %.2f) spicy loaded from cache", rep_id, w))
+        spicyCache   = readRDS(spicyFile)
+        spicySub     = spicyCache$spicySub
+        spicyMajor   = spicyCache$spicyMajor
+        spicyLineage = spicyCache$spicyLineage
+      } else {
+        message(sprintf("  Replicate %d / %d — running spicyR", rep_id, n_reps))
+        spicySub     = run_spicy_contrast(spe, "control", "signal", "sub",     cores = 8)
+        spicyMajor   = run_spicy_contrast(spe, "control", "signal", "major",   cores = 8)
+        spicyLineage = run_spicy_contrast(spe, "control", "signal", "lineage", cores = 8)
+        saveRDS(
+          list(spicySub = spicySub, spicyMajor = spicyMajor,
+               spicyLineage = spicyLineage),
+          spicyFile
+        )
+      }
+
+      # ── run methods ───────────────────────────────────────────────────
+      result = tryCatch(
+        run_all_methods(spicySub, spicyMajor, spicyLineage, spe, true_pairs),
+        error = function(e) {
+          message(sprintf("  Replicate %d (weight %.2f) failed: %s",
+                          rep_id, w, conditionMessage(e)))
+          NULL
+        }
+      )
+      if (is.null(result)) return(NULL)
+
+      out = result$metrics %>%
+        mutate(
+          rep_id        = rep_id,
+          scenario      = "Sensitivity - Repeated measure",
+          signal_weight = w,
+          n_subjects    = n_subjects,
+          n_images      = n_images
+        )
+      saveRDS(out, metricsFile)
+      rm(spe, spicySub, spicyMajor, spicyLineage, result)
+      gc()
+      out
+    }, .options = furrr_options(seed = TRUE))
+  })
+}
+```
+
+### Running Repeated Measure Sensitivity
+
+```{r}
+sensitivityRepeatedMetrics = run_sensitivity_repeated(
+  n_reps         = 20,
+  n_subjects     = 50,
+  n_images       = 5,
+  signal_weights = c(0.30, 0.50, 0.70, 0.90, 0.99)
+)
+saveRDS(sensitivityRepeatedMetrics, "results/simulation/sensitivity_repeated_metrics.rds")
+```
+
+### Creating Metrics for the Repeated Measure Sensitivity
+
+```{r}
+sensitivityRepeatedSummary = sensitivityRepeatedMetrics %>%
+  group_by(method, signal_weight) %>%
+  summarise(
+    mean_TPR = mean(TPR, na.rm = TRUE),
+    sd_TPR   = sd(TPR,   na.rm = TRUE),
+    mean_FDR = mean(FDR, na.rm = TRUE),
+    sd_FDR   = sd(FDR,   na.rm = TRUE),
+    mean_F1  = mean(F1,  na.rm = TRUE),
+    sd_F1    = sd(F1,    na.rm = TRUE),
+    n_reps   = n(),
+    .groups  = "drop"
+  ) %>%
+  arrange(signal_weight, desc(mean_TPR))
+```
+
+
+---
+
+# Combined Summary Across All Scenarios
+
+```{r}
+# allMetrics = bind_rows(
+#   singleReplicateMetrics,
+#   repeatedReplicateMetrics,
+#   sensitivitySingleMetrics,
+#   sensitivityRepeatedMetrics
+# )
+# 
+# allSummary = allMetrics %>%
+#   group_by(method, scenario, signal_weight) %>%
+#   summarise(
+#     mean_TPR = mean(TPR, na.rm = TRUE),
+#     sd_TPR   = sd(TPR,   na.rm = TRUE),
+#     mean_FDR = mean(FDR, na.rm = TRUE),
+#     sd_FDR   = sd(FDR,   na.rm = TRUE),
+#     mean_F1  = mean(F1,  na.rm = TRUE),
+#     sd_F1    = sd(F1,    na.rm = TRUE),
+#     n_reps   = n(),
+#     .groups  = "drop"
+#   ) %>%
+#   arrange(scenario, signal_weight, desc(mean_TPR))
+# 
+# saveRDS(allSummary, "results/simulation/all_summary.rds")
+```
+
+# Test
+
+```{r}
+# ── single replicate smoke test ───────────────────────────────────────────────
+wd = getwd()
+source(file.path(wd, "R/globals.R"))
+source(file.path(wd, "R/simulation_helpers.R"))
+source(file.path(wd, "R/benchmarking_helpers.R"))
+source(file.path(wd, "R/pfilter.R"))
+
+set.seed(42)
+
+df = purrr::map_dfr(seq_len(10), function(s) {
+  controlPart = simulate_one_subject_consistent(
+    subject_id  = s,
+    n_images    = 1,
+    win         = WIN,
+    condition   = "control",
+    add_signal  = FALSE,
+    total_cells = 10000
+  )
+  signalPart = simulate_one_subject_consistent(
+    subject_id    = s + 10,
+    n_images      = 1,
+    win           = WIN,
+    condition     = "signal",
+    add_signal    = TRUE,
+    signal_weight = 0.99,
+    total_cells   = 10000
+  )
+  bind_rows(controlPart, signalPart)
+})
+
+spe        = make_spe_from_df(df)
+spicySub     = run_spicy_contrast(spe, "control", "signal", "sub")
+spicyMajor   = run_spicy_contrast(spe, "control", "signal", "major")
+spicyLineage = run_spicy_contrast(spe, "control", "signal", "lineage")
+
+testResult   = run_all_methods(spicySub, spicyMajor, spicyLineage, spe, TRUE_PAIRS)
+
+glimpse(testResult$metrics)
+```
+

@@ -1,0 +1,32 @@
+---
+title: "Benchmarking_Replicates"
+output: html_document
+date: "2026-05-06"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(SpatialExperiment)
+library(spatstat.geom)
+library(spatstat.random)
+library(spatstat.explore)
+library(spicyR)
+library(TreeBH)
+library(DART)
+library(purrr)
+library(dplyr)
+library(furrr)
+source("R/globals.R")
+source("R/simulation_helpers.R")
+source("R/benchmarking_helpers.R")
+source("R/pfilter.R")
+```
+
+# Benchmarking Single Sensitivity
+
+```{r}
+
+```
+
+
+

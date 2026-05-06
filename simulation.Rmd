@@ -1,0 +1,273 @@
+---
+title: "simulation.Rmd"
+output: html_document
+date: "2026-03-29"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(spatstat.geom)
+library(spatstat.random)
+library(spatstat.explore)
+library(SpatialExperiment)
+library(spicyR)
+library(TreeBH)
+library(DART)
+library(purrr)
+library(dplyr)
+
+source("R/globals.R")
+source("R/simulation_helpers.R")
+source("R/benchmarking_helpers.R")
+source("R/pfilter.R")
+```
+
+# Global Variables
+
+```{r globals}
+WIN <- owin(c(0, 1000), c(0, 1000))
+
+SIGNAL_WEIGHTS <- c(0.5, 0.7, 0.9, 0.99)
+
+dir.create("results/simulation", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/spicy",      recursive = TRUE, showWarnings = FALSE)
+```
+
+# Single Measure (20 Subjects)
+
+```{r single_simulate}
+single_df <- purrr::map_dfr(1:20, function(s) {
+  control_part <- simulate_one_subject_consistent(
+    subject_id  = s,
+    n_images    = 1,
+    win         = WIN,
+    condition   = "control",
+    add_signal  = FALSE,
+    total_cells = 5000
+  )
+  signal_part <- simulate_one_subject_consistent(
+    subject_id    = s + 20,
+    n_images      = 1,
+    win           = WIN,
+    condition     = "signal",
+    add_signal    = TRUE,
+    signal_weight = 0.99,
+    total_cells   = 5000
+  )
+  bind_rows(control_part, signal_part)
+})
+
+saveRDS(single_df, "results/simulation/single_df.rds")
+```
+
+```{r single_spicy}
+spe_single         <- make_spe_from_df(single_df)
+spicy_single_sub   <- run_spicy_contrast(spe_single, "control", "signal", "sub")
+spicy_single_major <- run_spicy_contrast(spe_single, "control", "signal", "major")
+
+saveRDS(spicy_single_sub,   "results/spicy/spicy_single_sub.rds")
+saveRDS(spicy_single_major, "results/spicy/spicy_single_major.rds")
+
+topPairs(spicy_single_sub)
+spicyBoxPlot(spicy_single_sub, from = "CD4_T",    to = "NK")
+spicyBoxPlot(spicy_single_sub, from = "CD8_T",    to = "NK")
+spicyBoxPlot(spicy_single_sub, from = "Memory_T", to = "NK")
+```
+
+## Sensitivity Analysis — Single Measure
+
+```{r single_sensitivity_simulate}
+single_sensitivity_dfs <- purrr::map(
+  SIGNAL_WEIGHTS,
+  function(sw) {
+    message(sprintf("Simulating signal_weight = %.2f (single measure)", sw))
+
+    purrr::map_dfr(1:20, function(s) {
+      control_part <- simulate_one_subject_consistent(
+        subject_id  = s,
+        n_images    = 1,
+        win         = WIN,
+        condition   = "control",
+        add_signal  = FALSE,
+        total_cells = 5000
+      )
+      signal_part <- simulate_one_subject_consistent(
+        subject_id    = s + 20,
+        n_images      = 1,
+        win           = WIN,
+        condition     = "signal",
+        add_signal    = TRUE,
+        signal_weight = sw,
+        total_cells   = 5000
+      )
+      bind_rows(control_part, signal_part)
+    }) %>%
+      mutate(signal_weight = sw)
+  }
+) %>%
+  set_names(paste0("sw_", SIGNAL_WEIGHTS))
+
+saveRDS(single_sensitivity_dfs, "results/simulation/single_sensitivity_dfs.rds")
+```
+
+```{r single_sensitivity_spicy}
+single_sensitivity_spicy <- purrr::imap(single_sensitivity_dfs, function(df, sw_name) {
+  message(sprintf("Running spicy for %s (single measure)", sw_name))
+  spe <- make_spe_from_df(df)
+  list(
+    sub   = run_spicy_contrast(spe, "control", "signal", "sub"),
+    major = run_spicy_contrast(spe, "control", "signal", "major")
+  )
+}) %>%
+  set_names(names(single_sensitivity_dfs))
+
+saveRDS(single_sensitivity_spicy, "results/spicy/single_sensitivity_spicy.rds")
+```
+
+# Repeated Measures (20 Subjects, 5 Images Each)
+
+```{r repeated_simulate}
+repeated_df <- purrr::map_dfr(1:20, function(s) {
+  control_part <- simulate_one_subject_consistent(
+    subject_id  = s,
+    n_images    = 5,
+    win         = WIN,
+    condition   = "control",
+    add_signal  = FALSE,
+    total_cells = 5000
+  )
+  signal_part <- simulate_one_subject_consistent(
+    subject_id    = s + 20,
+    n_images      = 5,
+    win           = WIN,
+    condition     = "signal",
+    add_signal    = TRUE,
+    signal_weight = 0.99,
+    total_cells   = 5000
+  )
+  bind_rows(control_part, signal_part)
+})
+
+saveRDS(repeated_df, "results/simulation/repeated_df.rds")
+```
+
+```{r repeated_spicy}
+spe_repeated         <- make_spe_from_df(repeated_df)
+spicy_repeated_sub   <- run_spicy_contrast(spe_repeated, "control", "signal", "sub")
+spicy_repeated_major <- run_spicy_contrast(spe_repeated, "control", "signal", "major")
+
+saveRDS(spicy_repeated_sub,   "results/spicy/spicy_repeated_sub.rds")
+saveRDS(spicy_repeated_major, "results/spicy/spicy_repeated_major.rds")
+
+topPairs(spicy_repeated_sub)
+spicyBoxPlot(spicy_repeated_sub, from = "CD4_T",    to = "NK")
+spicyBoxPlot(spicy_repeated_sub, from = "CD8_T",    to = "NK")
+spicyBoxPlot(spicy_repeated_sub, from = "Memory_T", to = "NK")
+spicy_repeated_sub$p.value["CD4_T__NK",]
+spicy_repeated_sub$p.value["CD8_T__NK",]
+spicy_repeated_sub$p.value["Memory_T__NK",]
+```
+
+## Sensitivity Analysis — Repeated Measures
+
+```{r repeated_sensitivity_simulate}
+repeated_sensitivity_dfs <- purrr::map(
+  SIGNAL_WEIGHTS,
+  function(sw) {
+    message(sprintf("Simulating signal_weight = %.2f (repeated measures)", sw))
+
+    purrr::map_dfr(1:20, function(s) {
+      control_part <- simulate_one_subject_consistent(
+        subject_id  = s,
+        n_images    = 5,
+        win         = WIN,
+        condition   = "control",
+        add_signal  = FALSE,
+        total_cells = 5000
+      )
+      signal_part <- simulate_one_subject_consistent(
+        subject_id    = s + 20,
+        n_images      = 5,
+        win           = WIN,
+        condition     = "signal",
+        add_signal    = TRUE,
+        signal_weight = sw,
+        total_cells   = 5000
+      )
+      bind_rows(control_part, signal_part)
+    }) %>%
+      mutate(signal_weight = sw)
+  }
+) %>%
+  set_names(paste0("sw_", SIGNAL_WEIGHTS))
+
+saveRDS(repeated_sensitivity_dfs, "results/simulation/repeated_sensitivity_dfs.rds")
+```
+
+```{r repeated_sensitivity_spicy}
+repeated_sensitivity_spicy <- purrr::imap(repeated_sensitivity_dfs, function(df, sw_name) {
+  message(sprintf("Running spicy for %s (repeated measures)", sw_name))
+  spe <- make_spe_from_df(df)
+  list(
+    sub   = run_spicy_contrast(spe, "control", "signal", "sub"),
+    major = run_spicy_contrast(spe, "control", "signal", "major")
+  )
+}) %>%
+  set_names(names(repeated_sensitivity_dfs))
+
+saveRDS(repeated_sensitivity_spicy, "results/spicy/repeated_sensitivity_spicy.rds")
+```
+
+# Sanity Checks
+
+```{r sanity_helpers}
+plot_image_signal_check <- function(df, image_name, title_prefix = "") {
+  df %>%
+    filter(
+      image_id == image_name,
+      cellType_sub %in% c("NK", "CD4_T", "CD8_T", "Memory_T")
+    ) %>%
+    mutate(cell_class = ifelse(cellType_sub == "NK", "NK", "T cell")) %>%
+    ggplot(aes(x = x, y = y, colour = cell_class)) +
+    geom_point(size = 1, alpha = 0.7) +
+    coord_equal() +
+    theme_bw() +
+    ggtitle(paste0(title_prefix, image_name))
+}
+
+plot_density_heatmap <- function(df, image_name, title_prefix = "") {
+  df %>%
+    filter(
+      image_id == image_name,
+      cellType_sub %in% c("NK", "CD4_T", "CD8_T", "Memory_T")
+    ) %>%
+    mutate(cell_class = ifelse(cellType_sub == "NK", "NK", "T cell")) %>%
+    ggplot(aes(x = x, y = y)) +
+    stat_density_2d_filled(aes(fill = after_stat(level)), contour = TRUE) +
+    facet_wrap(~cell_class) +
+    coord_equal() +
+    theme_bw() +
+    labs(
+      title = paste0(title_prefix, image_name),
+      fill  = "Density"
+    )
+}
+```
+
+## Single Measure
+
+```{r sanity_single}
+plot_image_signal_check(single_df, "control_subj_1_img_1",  title_prefix = "[Single] ")
+plot_image_signal_check(single_df, "signal_subj_21_img_1",  title_prefix = "[Single] ")
+plot_density_heatmap(single_df,    "control_subj_1_img_1",  title_prefix = "[Single] ")
+plot_density_heatmap(single_df,    "signal_subj_21_img_1",  title_prefix = "[Single] ")
+```
+
+## Repeated Measures
+
+```{r sanity_repeated}
+plot_image_signal_check(repeated_df, "control_subj_1_img_1", title_prefix = "[Repeated] ")
+plot_image_signal_check(repeated_df, "signal_subj_6_img_2",  title_prefix = "[Repeated] ")
+plot_density_heatmap(repeated_df,    "control_subj_2_img_1", title_prefix = "[Repeated] ")
+plot_density_heatmap(repeated_df,    "signal_subj_7_img_5",  title_prefix = "[Repeated] ")
+```

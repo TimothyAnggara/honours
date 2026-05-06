@@ -1,0 +1,462 @@
+---
+title: "benchmarking"
+output: html_document
+date: "2026-03-29"
+---
+
+```{r}
+library(tidyverse)
+library(SpatialExperiment)
+library(spicyR)
+library(TreeBH)
+library(DART)
+library(purrr)
+library(dplyr)
+
+source("R/globals.R")
+source("R/simulation_helpers.R")
+source("R/benchmarking_helpers.R")
+source("R/pfilter.R")
+```
+
+
+```{r}
+# Core simulation outputs
+single_df    <- readRDS("results/simulation/single_df.rds")
+repeated_df  <- readRDS("results/simulation/repeated_df.rds")
+
+# Sensitivity analysis simulation outputs
+single_sensitivity_dfs   <- readRDS("results/simulation/single_sensitivity_dfs.rds")
+repeated_sensitivity_dfs <- readRDS("results/simulation/repeated_sensitivity_dfs.rds")
+
+# spicy outputs
+spicy_single_sub     <- readRDS("results/spicy/spicy_single_sub.rds")
+spicy_single_major   <- readRDS("results/spicy/spicy_single_major.rds")
+spicy_repeated_sub   <- readRDS("results/spicy/spicy_repeated_sub.rds")
+spicy_repeated_major <- readRDS("results/spicy/spicy_repeated_major.rds")
+
+# Sensitivity analysis spicy outputs
+single_sensitivity_spicy   <- readRDS("results/spicy/single_sensitivity_spicy.rds")
+repeated_sensitivity_spicy <- readRDS("results/spicy/repeated_sensitivity_spicy.rds")
+```
+
+```{r}
+topPairs(spicy_single_sub)
+topPairs(spicy_single_major)
+
+topPairs(spicy_repeated_sub)
+topPairs(spicy_repeated_major)
+
+spicy_single_sub$p.value["CD4_T__NK",]
+spicy_single_sub$p.value["CD8_T__NK",]
+spicy_single_sub$p.value["Memory_T__NK",]
+
+summary(spicy_single_sub)
+head(rownames(spicy_single_sub$p.value), 20)
+spicy_single_sub$p.value["CD4_T__NK",]
+
+"CD4_T__NK" %in% rownames(spicy_single_sub$p.value)
+"CD8_T__NK" %in% rownames(spicy_single_sub$p.value)
+"Memory_T__NK" %in% rownames(spicy_single_sub$p.value)
+
+extract_leaf_stats(spicy_single_sub) %>% 
+  filter(leaf %in% c("CD4_T__NK", "CD8_T__NK", "Memory_T__NK"))
+
+# Total pairs
+nrow(spicy_single_sub$p.value)
+
+# Self pairs (A__A)
+sum(sapply(rownames(spicy_single_sub$p.value), function(x) {
+  ab <- strsplit(x, "__", fixed = TRUE)[[1]]
+  ab[1] == ab[2]
+}))
+extract_leaf_stats(spicy_single_sub) %>% nrow()
+```
+
+
+# Ground Truth
+
+The simulated signal is co-localisation between T cell subtypes and NK cells.
+The three true positive pairs (in canonical `A__B` form) are defined here and
+used throughout all benchmarking computations.
+
+```{r ground_truth}
+TRUE_PAIRS <- c("CD4_T__NK", "CD8_T__NK", "Memory_T__NK")
+```
+
+# Benchmarking Helpers
+
+```{r helpers}
+#' Compute TPR, FDR, FPR, Precision, and F1 from a results tibble.
+#'
+#' @param result_df  A tibble with at least columns `leaf`, `reject`, `is_true`.
+#' @param true_pairs Character vector of true positive canonical pair names.
+#'
+#' @return A one-row tibble of performance metrics.
+compute_metrics <- function(result_df, true_pairs = TRUE_PAIRS) {
+  result_df <- result_df %>%
+    mutate(
+      is_true  = leaf %in% true_pairs,
+      rejected = as.logical(reject)
+    )
+
+  TP <- sum( result_df$is_true  &  result_df$rejected)
+  FP <- sum(!result_df$is_true  &  result_df$rejected)
+  FN <- sum( result_df$is_true  & !result_df$rejected)
+  TN <- sum(!result_df$is_true  & !result_df$rejected)
+
+  TPR       <- if ((TP + FN) > 0) TP / (TP + FN) else NA_real_
+  FDR       <- if ((TP + FP) > 0) FP / (TP + FP) else 0
+  FPR       <- if ((FP + TN) > 0) FP / (FP + TN) else NA_real_
+  Precision <- if ((TP + FP) > 0) TP / (TP + FP) else NA_real_
+  F1        <- if (!is.na(Precision) && !is.na(TPR) && (Precision + TPR) > 0)
+                 2 * Precision * TPR / (Precision + TPR) else NA_real_
+
+  tibble(TPR, FDR, FPR, Precision, F1, TP, FP, FN, TN)
+}
+
+#' Run all methods on a pair of spicy sub/major results.
+#'
+#' @param spicy_sub   spicyR result at the sub-type level.
+#' @param spicy_major spicyR result at the major-type level.
+#' @param spe         SpatialExperiment object (needed for DART).
+#' @param true_pairs  Character vector of ground-truth canonical pair names.
+#'
+#' @return A list with two elements:
+#'   \item{raw}{Tidy tibble, one row per method x leaf, with columns
+#'     method, leaf, pval, coef (where available), reject, is_true.}
+#'   \item{metrics}{Tidy tibble, one row per method, with columns
+#'     method, TPR, FDR, FPR, Precision, F1, TP, FP, FN, TN.}
+run_all_methods <- function(spicy_sub, spicy_major, spe,
+                            true_pairs = TRUE_PAIRS) {
+
+  # ── Flat BH (baseline) ───────────────────────────────────────────────
+  flat_bh <- extract_leaf_stats(spicy_sub) %>%
+    mutate(method = "Flat BH", reject = bh_reject(pval, q=0.05))
+
+  # ── Flat BY (baseline under arbitrary dependence) ────────────────────
+  flat_by <- extract_leaf_stats(spicy_sub) %>%
+    mutate(
+      method = "Flat BY",
+      reject = p.adjust(pval, method = "BY") <= 0.05
+    )
+
+  # ── TreeBH ───────────────────────────────────────────────────────────
+  treebh <- tryCatch(
+    run_treebh(spicy_sub),
+    error = function(e) {
+      message("TreeBH failed: ", conditionMessage(e))
+      extract_leaf_stats(spicy_sub) %>% mutate(method = "TreeBH", reject = FALSE)
+    }
+  )
+
+  # ── DART ─────────────────────────────────────────────────────────────
+  dart <- tryCatch(
+    run_dart_one(spicy_sub, spe),
+    error = function(e) {
+      message("DART failed: ", conditionMessage(e))
+      extract_leaf_stats(spicy_sub) %>% mutate(method = "DART", reject = FALSE)
+    }
+  )
+
+  # ── p-filter ─────────────────────────────────────────────────────────
+  pfilter_res <- tryCatch(
+    run_pfilter_one(spicy_sub, spicy_major),
+    error = function(e) {
+      message("pfilter failed: ", conditionMessage(e))
+      extract_leaf_stats(spicy_sub) %>% mutate(method = "pfilter", reject = FALSE)
+    }
+  )
+
+  # ── Ours (level-wise BH) ─────────────────────────────────────────────
+  ours_res <- tryCatch({
+    out <- run_ours_one(spicy_major, spicy_sub)
+    out$res_ours %>%
+      filter(level == 2) %>%
+      transmute(leaf = node, pval = pvalue, method = "Ours", reject)
+  }, error = function(e) {
+    message("Ours failed: ", conditionMessage(e))
+    extract_leaf_stats(spicy_sub) %>% mutate(method = "Ours", reject = FALSE)
+  })
+
+  # ── ClusterTrim (BY) ─────────────────────────────────────────────────
+  clustertrim <- tryCatch(
+    run_cluster_trim_one(spicy_sub, spicy_major),
+    error = function(e) {
+      message("ClusterTrim_BY failed: ", conditionMessage(e))
+      extract_leaf_stats(spicy_sub) %>%
+        mutate(method = "ClusterTrim_BY", reject = FALSE)
+    }
+  )
+
+  # ── Combine into raw tibble ──────────────────────────────────────────
+  all_raw <- list(flat_bh, flat_by, treebh, dart, pfilter_res, ours_res, clustertrim) %>%
+    purrr::map_dfr(function(df) {
+      df %>%
+        select(any_of(c("method", "leaf", "pval", "coef", "reject"))) %>%
+        mutate(
+          reject  = as.logical(reject),
+          is_true = leaf %in% true_pairs
+        )
+    })
+
+  # ── Compute per-method metrics from raw ──────────────────────────────
+  metrics <- all_raw %>%
+    group_by(method) %>%
+    group_modify(~ compute_metrics(.x, true_pairs)) %>%
+    ungroup()
+
+  list(raw = all_raw, metrics = metrics)
+}
+
+#' Display the leaf-level raw results as a formatted kable table.
+#'
+#' @param raw_df  The `$raw` tibble from `run_all_methods()`, optionally with
+#'                extra columns (signal_weight, scenario) already attached.
+#' @param caption Table caption string.
+display_raw_results <- function(raw_df, caption = "Leaf-level rejection results") {
+  raw_df %>%
+    mutate(
+      pval    = signif(pval, 3),
+      coef    = if ("coef" %in% names(.)) signif(coef, 3) else NA_real_,
+      reject  = ifelse(reject, "Yes", "No"),
+      is_true = ifelse(is_true, "\u2713", "")
+    ) %>%
+    select(any_of(c("method", "leaf", "pval", "coef",
+                    "reject", "is_true", "signal_weight", "scenario"))) %>%
+    arrange(method, leaf) %>%
+    filter(reject == "Yes")
+}
+```
+
+# Core Benchmarking
+
+## Single Measure (20 Subjects)
+
+```{r benchmark_single}
+spe_single     <- make_spe_from_df(single_df)
+results_single <- run_all_methods(spicy_single_sub, spicy_single_major, spe_single)
+
+raw_single     <- results_single$raw     %>% mutate(scenario = "Single measure")
+metrics_single <- results_single$metrics %>% mutate(scenario = "Single measure")
+
+saveRDS(raw_single,     "results/simulation/raw_single.rds")
+saveRDS(metrics_single, "results/simulation/metrics_single.rds")
+```
+
+### Leaf-level Results — Single Measure
+
+```{r raw_single_table}
+display_raw_results(
+  raw_single,
+  caption = "Single Measure — per-leaf rejection decisions (\u2713 = true signal pair)"
+)
+```
+
+### Performance Metrics — Single Measure
+
+```{r metrics_single_table}
+metrics_single %>%
+  select(method, TPR, FDR, FPR, Precision, F1) %>%
+  arrange(desc(TPR))
+```
+
+## Repeated Measures (5 Subjects × 5 Images)
+
+```{r benchmark_repeated}
+spe_repeated     <- make_spe_from_df(repeated_df)
+results_repeated <- run_all_methods(spicy_repeated_sub, spicy_repeated_major, spe_repeated)
+
+raw_repeated     <- results_repeated$raw     %>% mutate(scenario = "Repeated measures")
+metrics_repeated <- results_repeated$metrics %>% mutate(scenario = "Repeated measures")
+
+saveRDS(raw_repeated,     "results/simulation/raw_repeated.rds")
+saveRDS(metrics_repeated, "results/simulation/metrics_repeated.rds")
+```
+
+### Leaf-level Results — Repeated Measures
+
+```{r raw_repeated_table}
+display_raw_results(
+  raw_repeated,
+  caption = "Repeated Measures — per-leaf rejection decisions (\u2713 = true signal pair)"
+)
+```
+
+### Performance Metrics — Repeated Measures
+
+```{r metrics_repeated_table}
+metrics_repeated %>%
+  select(method, TPR, FDR, FPR, Precision, F1) %>%
+  arrange(desc(TPR)) %>%
+  knitr::kable(digits = 3, caption = "Repeated Measures — Method Performance")
+```
+
+## Combined Summary Table
+
+```{r combined_table}
+bind_rows(metrics_single, metrics_repeated) %>%
+  select(scenario, method, TPR, FDR, FPR, Precision, F1) %>%
+  arrange(scenario, desc(TPR)) %>%
+  knitr::kable(digits = 3, caption = "All Scenarios — Method Performance Summary")
+```
+
+# Sensitivity Analysis
+
+## Single Measure — Run All Methods Across Signal Weights
+
+```{r sensitivity_single_benchmark}
+single_sensitivity_results <- purrr::imap(
+  single_sensitivity_dfs,
+  function(df, sw_name) {
+    sw <- as.numeric(sub("sw_", "", sw_name))
+    message(sprintf("Benchmarking single measure: %s", sw_name))
+
+    spe         <- make_spe_from_df(df)
+    spicy_sub   <- single_sensitivity_spicy[[sw_name]]$sub
+    spicy_major <- single_sensitivity_spicy[[sw_name]]$major
+
+    out <- run_all_methods(spicy_sub, spicy_major, spe)
+    list(
+      raw     = out$raw     %>% mutate(signal_weight = sw, scenario = "Single measure"),
+      metrics = out$metrics %>% mutate(signal_weight = sw, scenario = "Single measure")
+    )
+  }
+)
+
+single_sensitivity_raw     <- purrr::map_dfr(single_sensitivity_results, "raw")
+single_sensitivity_metrics <- purrr::map_dfr(single_sensitivity_results, "metrics")
+
+saveRDS(single_sensitivity_raw,     "results/spicy/single_sensitivity_raw.rds")
+saveRDS(single_sensitivity_metrics, "results/simulation/single_sensitivity_metrics.rds")
+```
+
+### Leaf-level Results — Single Measure Sensitivity
+
+```{r raw_single_sensitivity_table}
+display_raw_results(
+  single_sensitivity_raw,
+  caption = "Single Measure Sensitivity — per-leaf rejection decisions by signal weight (\u2713 = true signal pair)"
+)
+```
+
+## Repeated Measures — Run All Methods Across Signal Weights
+
+```{r sensitivity_repeated_benchmark}
+repeated_sensitivity_results <- purrr::imap(
+  repeated_sensitivity_dfs,
+  function(df, sw_name) {
+    sw <- as.numeric(sub("sw_", "", sw_name))
+    message(sprintf("Benchmarking repeated measures: %s", sw_name))
+
+    spe         <- make_spe_from_df(df)
+    spicy_sub   <- repeated_sensitivity_spicy[[sw_name]]$sub
+    spicy_major <- repeated_sensitivity_spicy[[sw_name]]$major
+
+    out <- run_all_methods(spicy_sub, spicy_major, spe)
+    list(
+      raw     = out$raw     %>% mutate(signal_weight = sw, scenario = "Repeated measures"),
+      metrics = out$metrics %>% mutate(signal_weight = sw, scenario = "Repeated measures")
+    )
+  }
+)
+
+repeated_sensitivity_raw     <- purrr::map_dfr(repeated_sensitivity_results, "raw")
+repeated_sensitivity_metrics <- purrr::map_dfr(repeated_sensitivity_results, "metrics")
+
+saveRDS(repeated_sensitivity_raw,     "results/simulation/repeated_sensitivity_raw.rds")
+saveRDS(repeated_sensitivity_metrics, "results/simulation/repeated_sensitivity_metrics.rds")
+```
+
+### Leaf-level Results — Repeated Measures Sensitivity
+
+```{r raw_repeated_sensitivity_table}
+display_raw_results(
+  repeated_sensitivity_raw,
+  caption = "Repeated Measures Sensitivity — per-leaf rejection decisions by signal weight (\u2713 = true signal pair)"
+)
+```
+
+## Sensitivity Analysis — Metric Plots
+
+```{r sensitivity_plots, fig.width=10, fig.height=6}
+sensitivity_metrics <- bind_rows(
+  single_sensitivity_metrics,
+  repeated_sensitivity_metrics
+)
+
+METHOD_COLOURS <- c(
+  "Flat BH"        = "#E41A1C",
+  "Flat BY"        = "#FB9A99",
+  "TreeBH"         = "#377EB8",
+  "DART"           = "#4DAF4A",
+  "pfilter"        = "#984EA3",
+  "Ours"           = "#FF7F00",
+  "ClusterTrim_BY" = "#A65628"
+)
+
+plot_metric <- function(data, metric, y_label,
+                        hline = NULL, hline_colour = "grey40") {
+  p <- data %>%
+    ggplot(aes(x = signal_weight, y = .data[[metric]],
+               colour = method, group = method)) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 2.5) +
+    facet_wrap(~scenario) +
+    scale_colour_manual(values = METHOD_COLOURS, name = "Method") +
+    scale_x_continuous(breaks = SIGNAL_WEIGHTS) +
+    labs(x = "Signal weight", y = y_label) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "bottom")
+
+  if (!is.null(hline))
+    p <- p + geom_hline(yintercept = hline, linetype = "dashed",
+                        colour = hline_colour)
+  p
+}
+
+plot_metric(sensitivity_metrics, "TPR", "Power (TPR)") +
+  ggtitle("Power across signal weights")
+
+plot_metric(sensitivity_metrics, "FDR", "FDR",
+            hline = 0.05, hline_colour = "red") +
+  ggtitle("FDR across signal weights")
+
+plot_metric(sensitivity_metrics, "FPR", "FPR") +
+  ggtitle("FPR across signal weights")
+
+plot_metric(sensitivity_metrics, "Precision", "Precision") +
+  ggtitle("Precision across signal weights")
+
+plot_metric(sensitivity_metrics, "F1", "F1 score") +
+  ggtitle("F1 score across signal weights")
+```
+
+## Sensitivity Analysis — Metric Tables
+
+```{r sensitivity_table_long}
+sensitivity_metrics %>%
+  select(scenario, signal_weight, method, TPR, FDR, FPR, Precision, F1) %>%
+  arrange(scenario, signal_weight, desc(TPR)) %>%
+  knitr::kable(digits = 3,
+               caption = "Sensitivity Analysis — Metrics by Signal Weight")
+```
+
+```{r sensitivity_table_wide}
+sensitivity_metrics %>%
+  select(scenario, signal_weight, method, TPR, FDR) %>%
+  pivot_wider(
+    names_from  = method,
+    values_from = c(TPR, FDR),
+    names_glue  = "{method}_{.value}"
+  ) %>%
+  arrange(scenario, signal_weight) %>%
+  knitr::kable(digits = 3,
+               caption = "Sensitivity Analysis — TPR & FDR Wide Format")
+```
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
