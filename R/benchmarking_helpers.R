@@ -112,7 +112,10 @@ run_treebh = function(spicy_sub, conditionB = "signal",
 # DART
 # ============================================================
 extract_leaf_for_dart = function(spicy_sub, conditionB = "signal", eps = 1e-12) {
-  df = extract_leaf_stats(spicy_sub, conditionB, eps) %>% arrange(leaf)
+  df = extract_leaf_stats(spicy_sub, conditionB, eps) %>%
+    arrange(leaf) %>%
+    filter(!is.na(pval), !is.na(coef))  # drop pairs with NA coefs/pvals
+  
   list(
     df    = df,
     pvals = setNames(df$pval, df$leaf),
@@ -149,31 +152,58 @@ make_hypothesis_distance = function(leaf_names, major_map = MAJOR_MAP) {
 }
 
 run_dart_one = function(spicy_sub, spe, conditionB = "signal",
-                        alpha = 0.05, eps = 1e-12, Mgroup = 2) {
+                        alpha = 0.05, eps = 1e-12, Mgroup = 2,
+                        subject_col = "subject") {
+  
   leaf      = extract_leaf_for_dart(spicy_sub, conditionB, eps)
   pvals     = leaf$pvals
   coefs     = leaf$coefs
   leafNames = names(pvals)
   
+  cat(">>> [DART] n_hypotheses (m):", length(pvals), "\n")
+  cat(">>> [DART] any NA pvals:", any(is.na(pvals)), "\n")
+  cat(">>> [DART] any NA coefs:", any(is.na(coefs)), "\n")
+  cat(">>> [DART] pval range: [", min(pvals), ",", max(pvals), "]\n")
+  
   D    = make_hypothesis_distance(leafNames)
   maxD = max(D)
   D2   = if (maxD > 0) D / maxD else D
+  
+  cat(">>> [DART] maxD:", maxD, "\n")
+  cat(">>> [DART] any NA in D2:", any(is.na(D2)), "\n")
   
   z  = qnorm(1 - as.numeric(pvals) / 2) * sign(as.numeric(coefs))
   T1 = matrix(z, nrow = 1)
   m  = length(pvals)
   
-  # Fix: use number of subjects (independent units), not total images
-  n  = length(unique(spe$subject))
+  cat(">>> [DART] any NA/Inf in z:", any(is.na(z) | is.infinite(z)), "\n")
+  cat(">>> [DART] z range: [", min(z, na.rm = TRUE), ",", max(z, na.rm = TRUE), "]\n")
   
-  grids = 16 / sqrt(n * log(m) * log(log(m)))
+  n = length(unique(spe[[subject_col]]))
+  cat(">>> [DART] n_subjects (n):", n, "\n")
+  cat(">>> [DART] subject_col used:", subject_col, "\n")
+  
+  loglogm = log(log(m))
+  grids   = 16 / sqrt(n * log(m) * loglogm)
+  cat(">>> [DART] log(m):", log(m), "\n")
+  cat(">>> [DART] log(log(m)):", loglogm, "\n")
+  cat(">>> [DART] grids (before clamp):", grids, "\n")
+  grids = max(grids, 0.5)
+  cat(">>> [DART] grids (after clamp):", grids, "\n")
+  
+  cat(">>> [DART] calling A.tree.mult...\n")
   Atree = DART::A.tree.mult(grids = grids, Dist0 = D2, Mgroup = Mgroup)
-  res   = DART::test.mult(alpha = alpha, Llist = Atree$Llist,
-                          Dist0 = D2, T1 = T1)
+  cat(">>> [DART] A.tree.mult done\n")
+  
+  res = DART::test.mult(alpha = alpha, Llist = Atree$Llist,
+                        Dist0 = D2, T1 = T1)
+  cat(">>> [DART] test.mult done\n")
   
   dartIdx    = res[[length(res)]]
   dartReject = rep(FALSE, m)
   if (length(dartIdx) > 0) dartReject[dartIdx] = TRUE
+  
+  cat(">>> [DART] n_rejected:", sum(dartReject), "\n")
   
   tibble(leaf = leafNames, pval = as.numeric(pvals),
          coef = as.numeric(coefs), method = "DART", reject = dartReject)
@@ -193,6 +223,7 @@ extract_pfilter_inputs = function(spicy_sub, spicy_major,
     p_major = as.numeric(spicy_major$p.value[, colB])
   ) %>%
     group_by(fam) %>% dplyr::slice(1) %>% ungroup() %>%
+    filter(!is.na(p_major)) %>%                              # drop NA pvals
     mutate(p_major = pmin(pmax(p_major, eps), 1 - eps)) %>%
     arrange(fam)
   
@@ -201,12 +232,14 @@ extract_pfilter_inputs = function(spicy_sub, spicy_major,
     p_sub = as.numeric(spicy_sub$p.value[, colB])
   ) %>%
     group_by(leaf) %>% dplyr::slice(1) %>% ungroup() %>%
+    filter(!is.na(p_sub)) %>%                                # drop NA pvals
     tidyr::separate(leaf, into = c("a", "b"), sep = "__", remove = FALSE) %>%
     mutate(
       fam   = canonical_pair(paste0(MAJOR_MAP[a], "__", MAJOR_MAP[b])),
       p_sub = pmin(pmax(p_sub, eps), 1 - eps)
     ) %>%
     select(leaf, fam, p_sub) %>%
+    filter(fam %in% majorDf$fam) %>%                        # only keep subtypes whose family survived
     arrange(fam, leaf)
   
   list(major_df = majorDf, sub_df = subDf)
@@ -220,16 +253,20 @@ run_pfilter_one = function(spicy_sub, spicy_major,
   inp     = extract_pfilter_inputs(spicy_sub, spicy_major, conditionB, eps)
   majorDf = inp$major_df
   subDf   = inp$sub_df
-  nMajor  = nrow(majorDf)
-  nSub    = nrow(subDf)
-  nTotal  = nMajor + nSub
+  
+  # Drop subtypes whose family couldn't be matched — avoids NA group indices
+  parentIdx = match(subDf$fam, majorDf$fam)
+  subDf     = subDf[!is.na(parentIdx), ]
+  parentIdx = parentIdx[!is.na(parentIdx)]
+  
+  nMajor = nrow(majorDf)
+  nSub   = nrow(subDf)
+  nTotal = nMajor + nSub
   
   pAll   = c(majorDf$p_major, subDf$p_sub)
   groups = matrix(0L, nrow = nTotal, ncol = 2)
   
   groups[seq_len(nMajor), 1]      = seq_len(nMajor)
-  parentIdx                        = match(subDf$fam, majorDf$fam)
-  if (anyNA(parentIdx)) stop("Unmatched leaf families — check MAJOR_MAP.")
   groups[(nMajor + 1):nTotal, 1] = parentIdx
   groups[, 2]                     = seq_len(nTotal)
   
@@ -558,62 +595,64 @@ run_cluster_trim_one = function(spicy_sub, spicy_major,
 #'   \item{raw}{Tidy tibble, one row per method x leaf.}
 #'   \item{metrics}{Tidy tibble, one row per method with TPR/FDR/etc.}
 run_all_methods = function(spicy_sub, spicy_major, spicy_lineage, spe,
+                           conditionB = "signal",
                            true_pairs = TRUE_PAIRS) {
   
   # ── Flat BH ──────────────────────────────────────────────────────────
-  flatBh = extract_leaf_stats(spicy_sub) %>%
+  flatBh = extract_leaf_stats(spicy_sub, conditionB) %>%
     mutate(method = "Flat BH", reject = bh_reject(pval, q = 0.05))
   
   # ── Flat BY ──────────────────────────────────────────────────────────
-  flatBy = extract_leaf_stats(spicy_sub) %>%
+  flatBy = extract_leaf_stats(spicy_sub, conditionB) %>%
     mutate(method = "Flat BY",
            reject = p.adjust(pval, method = "BY") <= 0.05)
   
   # ── TreeBH ───────────────────────────────────────────────────────────
   treebh = tryCatch(
-    run_treebh(spicy_sub),
+    run_treebh(spicy_sub, conditionB = conditionB),
     error = function(e) {
       message("TreeBH failed: ", conditionMessage(e))
-      extract_leaf_stats(spicy_sub) %>% mutate(method = "TreeBH", reject = FALSE)
+      extract_leaf_stats(spicy_sub, conditionB) %>% mutate(method = "TreeBH", reject = FALSE)
     }
   )
   
   # ── DART ─────────────────────────────────────────────────────────────
   dart = tryCatch(
-    run_dart_one(spicy_sub, spe),
+    run_dart_one(spicy_sub, spe, conditionB = conditionB),
     error = function(e) {
       message("DART failed: ", conditionMessage(e))
-      extract_leaf_stats(spicy_sub) %>% mutate(method = "DART", reject = FALSE)
+      extract_leaf_stats(spicy_sub, conditionB) %>% mutate(method = "DART", reject = FALSE)
     }
   )
   
   # ── p-filter ─────────────────────────────────────────────────────────
   pfilterRes = tryCatch(
-    run_pfilter_one(spicy_sub, spicy_major),
+    run_pfilter_one(spicy_sub, spicy_major, conditionB = conditionB),
     error = function(e) {
       message("pfilter failed: ", conditionMessage(e))
-      extract_leaf_stats(spicy_sub) %>%
+      extract_leaf_stats(spicy_sub, conditionB) %>%
         mutate(method = "pfilter", reject = FALSE)
     }
   )
   
   # ── Ours (three-level: lineage -> major -> subtype) ──────────────────
   oursRes = tryCatch({
-    out = run_ours_one(spicy_lineage, spicy_major, spicy_sub, l1_method = "BY")
+    out = run_ours_one(spicy_lineage, spicy_major, spicy_sub,
+                       conditionB = conditionB, l1_method = "BY")
     out$res_ours %>%
       filter(level == 3) %>%
       transmute(leaf = node, pval = pvalue, method = "Ours", reject)
   }, error = function(e) {
     message("Ours failed: ", conditionMessage(e))
-    extract_leaf_stats(spicy_sub) %>% mutate(method = "Ours", reject = FALSE)
+    extract_leaf_stats(spicy_sub, conditionB) %>% mutate(method = "Ours", reject = FALSE)
   })
   
   # ── ClusterTrim (BY) ─────────────────────────────────────────────────
   clustertrim = tryCatch(
-    run_cluster_trim_one(spicy_sub, spicy_major, major_method = "BH"),
+    run_cluster_trim_one(spicy_sub, spicy_major, conditionB = conditionB, major_method = "BH"),
     error = function(e) {
       message("ClusterTrim_BY failed: ", conditionMessage(e))
-      extract_leaf_stats(spicy_sub) %>%
+      extract_leaf_stats(spicy_sub, conditionB) %>%
         mutate(method = "ClusterTrim_BY", reject = FALSE)
     }
   )
@@ -634,6 +673,125 @@ run_all_methods = function(spicy_sub, spicy_major, spicy_lineage, spe,
     group_by(method) %>%
     group_modify(~ compute_metrics(.x, true_pairs)) %>%
     ungroup()
+  
+  list(raw = allRaw, metrics = metrics)
+}
+
+run_all_methods_keren = function(spicy_sub, spicy_major, spicy_lineage, spe,
+                           conditionB = "signal",
+                           true_pairs = TRUE_PAIRS) {
+  
+  message("\n=== run_all_methods started ===")
+  message("Timestamp: ", Sys.time())
+  
+  # ── Flat BH ──────────────────────────────────────────────────────────
+  message("\n[1/7] Running Flat BH...")
+  flatBh = extract_leaf_stats(spicy_sub, conditionB) %>%
+    mutate(method = "Flat BH", reject = bh_reject(pval, q = 0.05))
+  message("  Done. Rejections: ", sum(flatBh$reject))
+  
+  # ── Flat BY ──────────────────────────────────────────────────────────
+  message("\n[2/7] Running Flat BY...")
+  flatBy = extract_leaf_stats(spicy_sub, conditionB) %>%
+    mutate(method = "Flat BY",
+           reject = !is.na(pval) & p.adjust(pval, method = "BY") <= 0.05)
+  message("  Done. Rejections: ", sum(flatBy$reject))
+  
+  # ── TreeBH ───────────────────────────────────────────────────────────
+  message("\n[3/7] Running TreeBH...")
+  treebh = tryCatch(
+    {
+      res = run_treebh(spicy_sub, conditionB = conditionB)
+      message("  Done. Rejections: ", sum(res$reject))
+      res
+    },
+    error = function(e) {
+      message("  TreeBH failed: ", conditionMessage(e))
+      extract_leaf_stats(spicy_sub, conditionB) %>% mutate(method = "TreeBH", reject = FALSE)
+    }
+  )
+  
+  # ── DART ─────────────────────────────────────────────────────────────
+  message("\n[4/7] Running DART...")
+  message("  (this may hang on large datasets — kill if no output after 2 min)")
+  dart = tryCatch(
+    {
+      run_dart_one(spicy_sub, spe, conditionB = conditionB, subject_col = "DONOR_NO")
+      message("  Done. Rejections: ", sum(res$reject))
+      res
+    },
+    error = function(e) {
+      message("  DART failed: ", conditionMessage(e))
+      extract_leaf_stats(spicy_sub, conditionB) %>% mutate(method = "DART", reject = FALSE)
+    }
+  )
+  
+  # ── p-filter ─────────────────────────────────────────────────────────
+  message("\n[5/7] Running p-filter...")
+  pfilterRes = tryCatch(
+    {
+      res = run_pfilter_one(spicy_sub, spicy_major, conditionB = conditionB)
+      message("  Done. Rejections: ", sum(res$reject))
+      res
+    },
+    error = function(e) {
+      message("  pfilter failed: ", conditionMessage(e))
+      extract_leaf_stats(spicy_sub, conditionB) %>%
+        mutate(method = "pfilter", reject = FALSE)
+    }
+  )
+  
+  # ── Ours ─────────────────────────────────────────────────────────────
+  message("\n[6/7] Running Ours...")
+  oursRes = tryCatch({
+    out = run_ours_one(spicy_lineage, spicy_major, spicy_sub,
+                       conditionB = conditionB, l1_method = "BY")
+    res = out$res_ours %>%
+      filter(level == 3) %>%
+      transmute(leaf = node, pval = pvalue, method = "Ours", reject)
+    message("  Done. Rejections: ", sum(res$reject))
+    res
+  }, error = function(e) {
+    message("  Ours failed: ", conditionMessage(e))
+    extract_leaf_stats(spicy_sub, conditionB) %>% mutate(method = "Ours", reject = FALSE)
+  })
+  
+  # ── ClusterTrim (BY) ─────────────────────────────────────────────────
+  message("\n[7/7] Running ClusterTrim...")
+  clustertrim = tryCatch(
+    {
+      res = run_cluster_trim_one(spicy_sub, spicy_major, conditionB = conditionB, major_method = "BH")
+      message("  Done. Rejections: ", sum(res$reject))
+      res
+    },
+    error = function(e) {
+      message("  ClusterTrim_BY failed: ", conditionMessage(e))
+      extract_leaf_stats(spicy_sub, conditionB) %>%
+        mutate(method = "ClusterTrim_BY", reject = FALSE)
+    }
+  )
+  
+  # ── Combine ──────────────────────────────────────────────────────────
+  message("\nCombining results...")
+  allRaw = list(flatBh, flatBy, treebh, dart, pfilterRes, oursRes, clustertrim) %>%
+    purrr::map_dfr(function(df) {
+      df %>%
+        select(any_of(c("method", "leaf", "pval", "coef", "reject"))) %>%
+        mutate(
+          reject  = as.logical(reject),
+          is_true = leaf %in% true_pairs
+        )
+    })
+  
+  # ── Metrics ──────────────────────────────────────────────────────────
+  message("Computing metrics...")
+  metrics = allRaw %>%
+    group_by(method) %>%
+    group_modify(~ compute_metrics(.x, true_pairs)) %>%
+    ungroup()
+  
+  message("\n=== run_all_methods complete ===")
+  message("Timestamp: ", Sys.time())
   
   list(raw = allRaw, metrics = metrics)
 }

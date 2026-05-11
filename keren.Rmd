@@ -1,0 +1,153 @@
+---
+title: "keren"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(SpatialExperiment)
+library(spatstat.geom)
+library(spatstat.random)
+library(spatstat.explore)
+library(spicyR)
+library(TreeBH)
+library(DART)
+library(purrr)
+library(dplyr)
+library(furrr)
+source("R/global_keren.R")
+source("R/simulation_helpers.R")
+source("R/benchmarking_helpers.R")
+source("R/pfilter.R")
+```
+
+```{r}
+kerenSPE <- SpatialDatasets::spe_Keren_2018()
+```
+
+```{r}
+# Remove unidentified cells and subset to two conditions
+kerenSub = kerenSPE[, kerenSPE$tumour_type %in% c("cold", "compartmentalised") &
+                       kerenSPE$cellType != "Unidentified"]
+kerenSub$tumour_type = droplevels(factor(kerenSub$tumour_type))
+
+# Add major and lineage labels to colData
+colData(kerenSub)$cellType_major = unname(KEREN_MAJOR_MAP[kerenSub$cellType])
+colData(kerenSub)$lineage        = unname(KEREN_LINEAGE_MAP[kerenSub$cellType])
+
+# Run spicy at all three levels
+spicySub     = spicy(kerenSub, condition = "tumour_type", cellType = "cellType",
+                     subject = "DONOR_NO", imageID = "imageID")
+spicyMajor   = spicy(kerenSub, condition = "tumour_type", cellType = "cellType_major",
+                     subject = "DONOR_NO", imageID = "imageID")
+spicyLineage = spicy(kerenSub, condition = "tumour_type", cellType = "lineage",
+                     subject = "DONOR_NO", imageID = "imageID")
+```
+
+```{r}
+run_all_methods_keren = function(spicy_sub   = spicySub,
+                                 spicy_major  = spicyMajor,
+                                 spicy_lineage = spicyLineage,
+                                 spe          = kerenSub,
+                                 conditionB   = "compartmentalised",
+                                 subject_col  = "DONOR_NO",
+                                 q            = 0.05) {
+  
+  # Set global maps required by helper functions
+  MAJOR_MAP         <<- KEREN_MAJOR_MAP
+  MAJOR_LINEAGE_MAP <<- KEREN_MAJOR_LINEAGE_MAP
+
+  # ── Flat BH ──────────────────────────────────────────────────────────
+  flatBh = extract_leaf_stats(spicy_sub, conditionB) %>%
+    mutate(method = "Flat BH", reject = bh_reject(pval, q = q))
+
+  # ── Flat BY ──────────────────────────────────────────────────────────
+  flatBy = extract_leaf_stats(spicy_sub, conditionB) %>%
+    mutate(method = "Flat BY",
+           reject = p.adjust(pval, method = "BY") <= q)
+
+  # ── TreeBH ───────────────────────────────────────────────────────────
+  treebh = tryCatch(
+    run_treebh(spicy_sub, conditionB = conditionB, q = c(q, q)),
+    error = function(e) {
+      message("TreeBH failed: ", conditionMessage(e))
+      extract_leaf_stats(spicy_sub, conditionB) %>%
+        mutate(method = "TreeBH", reject = FALSE)
+    }
+  )
+
+  # ── DART ─────────────────────────────────────────────────────────────
+  dart = tryCatch(
+    run_dart_one(spicy_sub, spe, conditionB = conditionB,
+                 alpha = q, subject_col = subject_col),
+    error = function(e) {
+      message("DART failed: ", conditionMessage(e))
+      extract_leaf_stats(spicy_sub, conditionB) %>%
+        mutate(method = "DART", reject = FALSE)
+    }
+  )
+
+  # ── p-filter ─────────────────────────────────────────────────────────
+  pfilterRes = tryCatch(
+    run_pfilter_one(spicy_sub, spicy_major, conditionB = conditionB,
+                    alpha_major = q, alpha_leaf = q),
+    error = function(e) {
+      message("pfilter failed: ", conditionMessage(e))
+      extract_leaf_stats(spicy_sub, conditionB) %>%
+        mutate(method = "pfilter", reject = FALSE)
+    }
+  )
+
+  # ── Ours ─────────────────────────────────────────────────────────────
+  oursRes = tryCatch({
+    out = run_ours_one(spicy_lineage, spicy_major, spicy_sub,
+                       conditionB = conditionB, q = q, l1_method = "BY")
+    out$res_ours %>%
+      filter(level == 3) %>%
+      transmute(leaf = node, pval = pvalue, method = "Ours", reject)
+  }, error = function(e) {
+    message("Ours failed: ", conditionMessage(e))
+    extract_leaf_stats(spicy_sub, conditionB) %>%
+      mutate(method = "Ours", reject = FALSE)
+  })
+
+  # ── ClusterTrim ───────────────────────────────────────────────────────
+  clustertrim = tryCatch(
+    run_cluster_trim_one(spicy_sub, spicy_major, conditionB = conditionB,
+                         q = q, major_method = "BH"),
+    error = function(e) {
+      message("ClusterTrim_BY failed: ", conditionMessage(e))
+      extract_leaf_stats(spicy_sub, conditionB) %>%
+        mutate(method = "ClusterTrim_BY", reject = FALSE)
+    }
+  )
+
+  # ── Combine ──────────────────────────────────────────────────────────
+  allRaw = list(flatBh, flatBy, treebh, dart, pfilterRes, oursRes, clustertrim) %>%
+    purrr::map_dfr(function(df) {
+      df %>%
+        select(any_of(c("method", "leaf", "pval", "coef", "reject"))) %>%
+        mutate(reject = as.logical(reject))
+    })
+
+  # ── Summary (no ground truth) ─────────────────────────────────────────
+  summary = allRaw %>%
+    group_by(method) %>%
+    summarise(n_rejected = sum(reject), n_total = n(), .groups = "drop") %>%
+    arrange(desc(n_rejected))
+
+  list(raw = allRaw, summary = summary)
+}
+```
+
+```{r}
+kerenBench = run_all_methods_keren()
+kerenBench$summary
+kerenBench$raw %>% filter(reject) %>% arrange(method, pval)
+```
+
+
+
+
+
+
