@@ -56,6 +56,25 @@ run_all_methods_keren = function(spicy_sub   = spicySub,
   # Set global maps required by helper functions
   MAJOR_MAP         <<- KEREN_MAJOR_MAP
   MAJOR_LINEAGE_MAP <<- KEREN_MAJOR_LINEAGE_MAP
+  
+  # ── Filter NA pairs once, upfront ────────────────────────────────────
+  # Identify subtype pairs with NA pval or coef and exclude them from all
+  # methods. This replaces per-helper NA filtering in extract_leaf_for_dart
+  # and extract_pfilter_inputs.
+  allLeafStats = extract_leaf_stats(spicy_sub, conditionB)
+
+  naLeaves = allLeafStats %>%
+    filter(is.na(pval) | is.na(coef)) %>%
+    pull(leaf)
+
+  if (length(naLeaves) > 0) {
+    message("Dropping ", length(naLeaves), " pairs with NA pvals/coefs:")
+    message(paste(naLeaves, collapse = ", "))
+
+    validRows = !(canonical_pair(rownames(spicy_sub$p.value)) %in% naLeaves)
+    spicy_sub$p.value      = spicy_sub$p.value[validRows, , drop = FALSE]
+    spicy_sub$coefficient  = spicy_sub$coefficient[validRows, , drop = FALSE]
+  }
 
   # ── Flat BH ──────────────────────────────────────────────────────────
   flatBh = extract_leaf_stats(spicy_sub, conditionB) %>%
@@ -139,6 +158,34 @@ run_all_methods_keren = function(spicy_sub   = spicySub,
   list(raw = allRaw, summary = summary)
 }
 ```
+
+```{r}
+naLeaves = extract_leaf_stats(spicySub, "compartmentalised") %>%
+  filter(is.na(coef) | is.na(pval)) %>%
+  pull(leaf)
+```
+
+```{r}
+pairCounts = as.data.frame(colData(kerenSub)) %>%
+  group_by(imageID) %>%
+  summarise(
+    hasDC     = "DC" %in% cellType,
+    hasTregs  = "Tregs" %in% cellType,
+    hasBcell  = "B_cell" %in% cellType,
+    hasNK     = "NK" %in% cellType,
+    .groups   = "drop"
+  ) %>%
+  summarise(
+    `DC + NK`      = sum(hasDC & hasNK),
+    `DC + Tregs`   = sum(hasDC & hasTregs),
+    `DC + B_cell`  = sum(hasDC & hasBcell),
+    `B_cell + Tregs` = sum(hasBcell & hasTregs)
+  )
+
+print(pairCounts)
+```
+
+
 
 ```{r}
 kerenBench = run_all_methods_keren()

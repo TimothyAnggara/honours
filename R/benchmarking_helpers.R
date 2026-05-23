@@ -113,9 +113,7 @@ run_treebh = function(spicy_sub, conditionB = "signal",
 # ============================================================
 extract_leaf_for_dart = function(spicy_sub, conditionB = "signal", eps = 1e-12) {
   df = extract_leaf_stats(spicy_sub, conditionB, eps) %>%
-    arrange(leaf) %>%
-    filter(!is.na(pval), !is.na(coef))  # drop pairs with NA coefs/pvals
-  
+    arrange(leaf) 
   list(
     df    = df,
     pvals = setNames(df$pval, df$leaf),
@@ -223,7 +221,6 @@ extract_pfilter_inputs = function(spicy_sub, spicy_major,
     p_major = as.numeric(spicy_major$p.value[, colB])
   ) %>%
     group_by(fam) %>% dplyr::slice(1) %>% ungroup() %>%
-    filter(!is.na(p_major)) %>%                              # drop NA pvals
     mutate(p_major = pmin(pmax(p_major, eps), 1 - eps)) %>%
     arrange(fam)
   
@@ -232,7 +229,6 @@ extract_pfilter_inputs = function(spicy_sub, spicy_major,
     p_sub = as.numeric(spicy_sub$p.value[, colB])
   ) %>%
     group_by(leaf) %>% dplyr::slice(1) %>% ungroup() %>%
-    filter(!is.na(p_sub)) %>%                                # drop NA pvals
     tidyr::separate(leaf, into = c("a", "b"), sep = "__", remove = FALSE) %>%
     mutate(
       fam   = canonical_pair(paste0(MAJOR_MAP[a], "__", MAJOR_MAP[b])),
