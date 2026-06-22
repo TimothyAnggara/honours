@@ -190,7 +190,7 @@ print(pairCounts)
 ```{r}
 kerenBench = run_all_methods_keren()
 kerenBench$summary
-kerenBench$raw %>% filter(reject) %>% arrange(method, pval)
+kerenBench$raw %>% filter(reject) %>% arrange(method, pval) %>% print( n = Inf)
 ```
 
 

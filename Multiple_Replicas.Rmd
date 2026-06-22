@@ -29,13 +29,13 @@ plan(multisession, workers = n_workers)
 dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
 
 method_order = c(
-  "Flat BH",
-  "Flat BY",
   "TreeBH",
   "DART",
   "pfilter",
   "Ours",
-  "ClusterTrim_BY"
+  "ClusterTrim_BY",
+  "Flat BH",
+  "Flat BY"
 )
 
 plot_theme = theme_minimal(base_size = 12) +
@@ -373,6 +373,8 @@ saveRDS(sensitivitySingleMetrics, "results/simulation/sensitivity_single_metrics
 ### Creating Metrics for the Single Measure Sensitivity
 
 ```{r}
+sensitivitySingleMetrics <- readRDS("results/simulation/sensitivity_single_metrics.rds")
+
 sensitivitySingleSummary = sensitivitySingleMetrics %>%
   group_by(method, signal_weight) %>%
   summarise(
@@ -387,7 +389,7 @@ sensitivitySingleSummary = sensitivitySingleMetrics %>%
   ) %>%
   arrange(signal_weight, desc(mean_TPR))
 
-view(sensitivitySingleSummary)
+print(sensitivitySingleSummary, n = Inf)
 ```
 
 ---
@@ -523,6 +525,8 @@ saveRDS(sensitivityRepeatedMetrics, "results/simulation/sensitivity_repeated_met
 ### Creating Metrics for the Repeated Measure Sensitivity
 
 ```{r}
+sensitivityRepeatedMetrics <- readRDS("results/simulation/sensitivity_repeated_metrics.rds")
+
 sensitivityRepeatedSummary = sensitivityRepeatedMetrics %>%
   group_by(method, signal_weight) %>%
   summarise(
@@ -537,7 +541,7 @@ sensitivityRepeatedSummary = sensitivityRepeatedMetrics %>%
   ) %>%
   arrange(signal_weight, desc(mean_TPR))
 
-view(sensitivityRepeatedSummary)
+print(sensitivityRepeatedSummary, n = Inf)
 ```
 
 
@@ -585,7 +589,7 @@ fig_power = ggplot(
     title = "Power across increasing signal strength",
     subtitle = "Power is measured as the true positive rate across 20 simulation replicates",
     x = "Signal weight",
-    y = "Mean power / TPR",
+    y = "Mean power",
     colour = "Method"
   ) +
   plot_theme
@@ -666,7 +670,7 @@ fig_tradeoff = ggplot(
     title = "Power-FDR trade-off across methods",
     subtitle = "Each point is one method at one signal weight; labels show signal weight",
     x = "Mean FDR",
-    y = "Mean power / TPR",
+    y = "Mean power",
     colour = "Method"
   ) +
   plot_theme
@@ -763,7 +767,7 @@ fig_power = ggplot(
     title = "Power across increasing signal strength",
     subtitle = "Power is measured as the true positive rate across 20 simulation replicates",
     x = "Signal weight",
-    y = "Mean power / TPR",
+    y = "Mean power",
     colour = "Method"
   ) +
   plot_theme
@@ -844,7 +848,7 @@ fig_tradeoff = ggplot(
     title = "Power-FDR trade-off across methods",
     subtitle = "Each point is one method at one signal weight; labels show signal weight",
     x = "Mean FDR",
-    y = "Mean power / TPR",
+    y = "Mean power",
     colour = "Method"
   ) +
   plot_theme
@@ -944,7 +948,22 @@ glimpse(testResult$metrics)
 ```
 
 ```{r}
+# Check what method names actually exist in your data
+unique(sensitivityRepeatedSummary$method)
 
+# Check which ones become NA after factoring
+sensitivityRepeatedSummary %>%
+  mutate(method = factor(method, levels = method_order)) %>%
+  filter(is.na(method))
+
+# Check if Flat BH is missing upstream
+sensitivityRepeatedMetrics %>%
+  bind_rows() %>%
+  count(method, signal_weight) %>%
+  tidyr::pivot_wider(names_from = signal_weight, values_from = n)
+
+class(sensitivityRepeatedMetrics)
+str(sensitivityRepeatedMetrics, max.level = 2)
 ```
 
 

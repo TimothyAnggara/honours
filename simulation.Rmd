@@ -263,6 +263,78 @@ plot_density_heatmap(single_df,    "control_subj_1_img_1",  title_prefix = "[Sin
 plot_density_heatmap(single_df,    "signal_subj_21_img_1",  title_prefix = "[Single] ")
 ```
 
+```{r}
+library(patchwork)
+
+# ── Build each panel individually ─────────────────────────────────────────────
+
+pScatterControl = plot_image_signal_check(
+  single_df,
+  "control_subj_1_img_1"
+) +
+  labs(title = "Control — cell locations") +
+  theme(legend.position = "bottom")
+
+pScatterSignal = plot_image_signal_check(
+  single_df,
+  "signal_subj_21_img_1"
+) +
+  labs(title = "Signal — cell locations") +
+  theme(legend.position = "bottom")
+
+pDensityControl = plot_density_heatmap(
+  single_df,
+  "control_subj_1_img_1"
+) +
+  labs(title = "Control — kernel density") +
+  theme(legend.position = "bottom") +
+  guides(fill = "none")
+
+pDensitySignal = plot_density_heatmap(
+  single_df,
+  "signal_subj_21_img_1"
+) +
+  labs(title = "Signal — kernel density") +
+  theme(legend.position = "bottom") +
+  guides(fill = "none")
+
+# ── Combine into 2x2 ──────────────────────────────────────────────────────────
+# Top row: scatter plots; bottom row: density heatmaps
+
+fig2x2 = (pScatterControl | pScatterSignal) /
+          (pDensityControl | pDensitySignal) +
+  plot_annotation(
+    title    = "Signal injection: control vs signal condition",
+    subtitle = "NK cells and T-cell subtypes shown; signal weight w = 0.99",
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 10, colour = "grey40")
+    )
+  )
+
+fig2x2
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+
+ggsave(
+  "results/figures/signal_injection_2x2.pdf",
+  plot   = fig2x2,
+  width  = 10,
+  height = 10
+)
+
+ggsave(
+  "results/figures/signal_injection_2x2.png",
+  plot   = fig2x2,
+  width  = 10,
+  height = 10,
+  dpi    = 300
+)
+```
+
+
+
 ## Repeated Measures
 
 ```{r sanity_repeated}

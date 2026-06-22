@@ -1,0 +1,137 @@
+---
+title: "Tables & Figures"
+output: html_document
+date: "2026-05-23"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+
+str(sensitivityRepeatedMetrics) <- readRDS("results/simulation/sensitivity_repeated_metrics.rds")
+sensitivitySingleMetrics <- readRDS("results/simulation/sensitivity_single_metrics.rds")
+```
+
+```{r}
+summarise_metrics <- function(df, label, weight) {
+  df %>%
+    group_by(method, signal_weight) %>%
+    filter(signal_weight == weight) %>%
+    summarise(
+      dataset  = label,
+      mean_TPR = mean(TPR, na.rm = TRUE),
+      sd_TPR   = sd(TPR,   na.rm = TRUE),
+      mean_FDR = mean(FDR, na.rm = TRUE),
+      sd_FDR   = sd(FDR,   na.rm = TRUE),
+      .groups  = "drop"
+    )
+}
+
+bind_rows(
+  summarise_metrics(sensitivityRepeatedMetrics, "Repeated", 0.99),
+  summarise_metrics(sensitivitySingleMetrics,   "Single", 0.99)
+)
+```
+
+
+```{r}
+# ── Summarise: mean TPR and FDR per method x signal_weight ───────────
+summarise_metrics <- function(df) {
+  df %>%
+    group_by(method, signal_weight) %>%
+    summarise(
+      mean_TPR = mean(TPR, na.rm = TRUE),
+      mean_FDR = mean(FDR, na.rm = TRUE),
+      sd_TPR   = sd(TPR, na.rm = TRUE),
+      sd_FDR   = sd(FDR, na.rm = TRUE),
+      .groups  = "drop"
+    )
+}
+
+singleSummary   <- summarise_metrics(sensitivitySingleMetrics)
+repeatedSummary <- summarise_metrics(sensitivityRepeatedMetrics)
+
+# ── Method colour palette (shared across all plots) ──────────────────
+METHOD_COLOURS <- c(
+  "Flat BH"       = "#E41A1C",
+  "Flat BY"       = "#FF7F00",
+  "TreeBH"        = "#4DAF4A",
+  "DART"          = "#984EA3",
+  "pfilter"       = "#377EB8",
+  "Ours"          = "#000000",
+  "ClusterTrim_BY"= "#A65628"
+)
+
+# ── Helper: TPR + FDR line plot ───────────────────────────────────────
+plot_sensitivity <- function(summary_df, scenario_title) {
+  
+  tpr_plot <- summary_df %>%
+    ggplot(aes(x = signal_weight, y = mean_TPR,
+               colour = method, group = method)) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 2) +
+    scale_colour_manual(values = METHOD_COLOURS) +
+    scale_x_continuous(breaks = unique(summary_df$signal_weight)) +
+    labs(
+      title  = paste(scenario_title, "— TPR"),
+      x      = "Signal Weight",
+      y      = "Mean TPR",
+      colour = "Method"
+    ) +
+    theme_bw() +
+    theme(legend.position = "bottom")
+  
+  fdr_plot <- summary_df %>%
+    ggplot(aes(x = signal_weight, y = mean_FDR,
+               colour = method, group = method)) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 2) +
+    geom_hline(yintercept = 0.05, linetype = "dashed", colour = "grey40") +
+    scale_colour_manual(values = METHOD_COLOURS) +
+    scale_x_continuous(breaks = unique(summary_df$signal_weight)) +
+    labs(
+      title  = paste(scenario_title, "— FDR"),
+      x      = "Signal Weight",
+      y      = "Mean FDR",
+      colour = "Method"
+    ) +
+    theme_bw() +
+    theme(legend.position = "bottom")
+  
+  list(tpr = tpr_plot, fdr = fdr_plot)
+}
+
+# ── Generate plots ────────────────────────────────────────────────────
+singlePlots   <- plot_sensitivity(singleSummary,   "Single Measure")
+repeatedPlots <- plot_sensitivity(repeatedSummary, "Repeated Measures")
+
+singlePlots$tpr
+singlePlots$fdr
+repeatedPlots$tpr
+repeatedPlots$fdr
+
+# ── Table: results at signal_weight == 0.99 (your main experiment) ───
+table_at_99_sd <- function(df) {
+  df %>%
+    filter(signal_weight == 0.99) %>%
+    group_by(method) %>%
+    summarise(
+      mean_TPR = mean(TPR, na.rm = TRUE),
+      sd_TPR   = sd(TPR,   na.rm = TRUE),
+      mean_FDR = mean(FDR, na.rm = TRUE),
+      sd_FDR   = sd(FDR,   na.rm = TRUE),
+      mean_F1  = mean(F1,  na.rm = TRUE),
+      sd_F1    = sd(F1,    na.rm = TRUE),
+      .groups  = "drop"
+    ) %>%
+    arrange(desc(mean_TPR))
+}
+
+singleSD   <- table_at_99_sd(sensitivitySingleMetrics)
+repeatedSD <- table_at_99_sd(sensitivityRepeatedMetrics)
+
+print(singleSD)
+print(repeatedSD)
+```
+
+
+
